@@ -8,6 +8,10 @@ app = FastAPI(title="DMAP-AI API")
 origins = [o.strip() for o in os.getenv("ALLOW_ORIGINS","").split(",") if o.strip()] or ["*"]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"])
 
+@app.get("/")
+def home():
+    return {"service": "DMAP-AI API", "status": "live"}
+    
 @app.get("/health")
 def health():
     return {"ok": True}
