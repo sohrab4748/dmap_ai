@@ -1,26 +1,33 @@
 """
 DMAP-AI API (demo-locked)
-- SPI endpoints:
-    • /indices/spi — z-score SPI from provided P sum/mean/std (kept for quick tests)
-    • /demo/spi_historical_auto — z-score SPI computed from NASA POWER daily (baseline window)
-    • /demo/spi_gamma_historical_auto — Gamma-fit SPI with zero-precip adjustment, mapped to standard normal
-    • /demo/spi_gamma_series — NEW: SPI series (monthly or yearly), supports custom anchor and yearly aggregation
+Adds SPI monthly & yearly Gamma series and a convenience endpoint.
+
+Endpoints
+---------
+• GET /                     — info
+• GET /health               — health
+• GET /indices/spi          — z-score SPI from user-provided sum/mean/std
+• GET /demo/spi_historical_auto           — legacy z-score SPI using NASA POWER
+• GET /demo/spi_gamma_historical_auto     — single Gamma SPI on trailing window
+• GET /demo/spi_gamma_series              — NEW: SPI series (step=month|year)
+• GET /demo/spi_gamma_both                — NEW: returns {monthly, yearly}
+• GET /indices/spei, /forecast/next7      — disabled in demo
 """
 
 import os
+import calendar
 import datetime as dt
 from statistics import mean, stdev
-from typing import Optional, Tuple, Dict, List, Literal, DefaultDict
-from collections import defaultdict
+from typing import Optional, Tuple, Dict, List, Literal
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware 
+from fastapi.middleware.cors import CORSMiddleware
 
 # SciPy for Gamma CDF and Normal inverse CDF
 from scipy.stats import gamma as gamma_dist, norm
 
-app = FastAPI(title="DMAP-AI API", version="0.6.0")
+app = FastAPI(title="DMAP-AI API", version="0.7.0")
 
 # ----------------------------- CORS ---------------------------------
 app.add_middleware(
@@ -36,7 +43,6 @@ DEMO_LOCK = os.getenv("DEMO_LOCK", "1") == "1"
 ALLOWED_MODE = os.getenv("DEMO_MODE", "historical").lower()
 ALLOWED_AOI = os.getenv("DEMO_AOI", "point").lower()
 ALLOWED_DATASOURCE = os.getenv("DEMO_DATASOURCE", "era5").lower()
-
 
 def _enforce_demo(mode: Optional[str], aoi: Optional[str], datasource: Optional[str]):
     if not DEMO_LOCK:
@@ -57,16 +63,14 @@ def _enforce_demo(mode: Optional[str], aoi: Optional[str], datasource: Optional[
             "allowed": {"mode": ALLOWED_MODE, "aoi": ALLOWED_AOI, "datasource": ALLOWED_DATASOURCE}
         })
 
-
+# --------------------------- Root/Health ----------------------------
 @app.get("/")
 def root():
     return {"ok": True, "message": "DMAP-AI API. See /health and /docs", "demo_lock": DEMO_LOCK}
 
-
 @app.get("/health")
 def health():
     return {"ok": True, "demo_lock": DEMO_LOCK}
-
 
 # -------------------------- SPI (z-score) ---------------------------
 @app.get("/indices/spi")
@@ -91,15 +95,12 @@ def spi(
         "note": "Gamma-fit SPI also available at /demo/spi_gamma_historical_auto.",
     }
 
-
 # ------------------- Common helpers for auto SPI --------------------
 POWER_BASE = "https://power.larc.nasa.gov/api/temporal/daily/point"
 POWER_PARAM = "PRECTOTCORR"  # daily precipitation (mm/day)
 
-
 def _yyyymmdd(d: dt.date) -> str:
     return d.strftime("%Y%m%d")
-
 
 def _parse_baseline(baseline: str) -> Tuple[int, int]:
     try:
@@ -107,7 +108,6 @@ def _parse_baseline(baseline: str) -> Tuple[int, int]:
         return int(a), int(b)
     except Exception:
         return (1981, 2010)
-
 
 def _fetch_power_precip(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
     params = {
@@ -127,16 +127,7 @@ def _fetch_power_precip(lat: float, lon: float, start: dt.date, end: dt.date) ->
              or j.get("parameters", {}).get(POWER_PARAM))
     if not isinstance(param, dict):
         raise HTTPException(status_code=502, detail={"message": "Unexpected NASA POWER payload", "sample_keys": list(j.keys())[:5]})
-    # keys may be strings of YYYYMMDD; ensure str keys -> float values
-    out: Dict[str, float] = {}
-    for k, v in param.items():
-        kk = str(k)
-        try:
-            out[kk] = float(v)
-        except Exception:
-            out[kk] = 0.0
-    return out
-
+    return {k: float(v) for k, v in param.items()}
 
 def _sum_window(s: dt.date, e: dt.date, dct: Dict[str, float]) -> float:
     total = 0.0
@@ -145,7 +136,6 @@ def _sum_window(s: dt.date, e: dt.date, dct: Dict[str, float]) -> float:
         total += dct.get(_yyyymmdd(cur), 0.0)
         cur += dt.timedelta(days=1)
     return total
-
 
 def _aligned_baseline_window_sums(end: dt.date, win: int, base_all: Dict[str, float], by0: int, by1: int) -> List[float]:
     """One window-sum per baseline year, aligned to end.month/end.day (clamp Feb 29)."""
@@ -160,43 +150,70 @@ def _aligned_baseline_window_sums(end: dt.date, win: int, base_all: Dict[str, fl
         sums.append(_sum_window(start_y, end_y, base_all))
     return sums
 
+# --------------- Extra helpers for monthly & yearly SPI --------------
 
-def _last_day_of_month(y: int, m: int) -> dt.date:
-    if m == 12:
-        return dt.date(y, 12, 31)
-    return dt.date(y, m + 1, 1) - dt.timedelta(days=1)
+def _last_day_of_month(y: int, m: int) -> int:
+    return calendar.monthrange(y, m)[1]
 
-
-def _month_end_dates(start: dt.date, end: dt.date) -> List[dt.date]:
-    """All month-end dates between start and end inclusive."""
-    dates: List[dt.date] = []
+def _month_iter(start: dt.date, end: dt.date):
+    """Yield (year, month) pairs between two dates inclusive."""
     y, m = start.year, start.month
-    first = _last_day_of_month(y, m)
-    if first < start:
-        # move to next month
+    while (y < end.year) or (y == end.year and m <= end.month):
+        yield (y, m)
         if m == 12:
-            y, m = y + 1, 1
+            y += 1; m = 1
         else:
             m += 1
-        first = _last_day_of_month(y, m)
-    cur = first
-    while cur <= end:
-        dates.append(cur)
-        if cur.month == 12:
-            y, m = cur.year + 1, 1
-        else:
-            y, m = cur.year, cur.month + 1
-        cur = _last_day_of_month(y, m)
-    return dates
 
+def _annual_sum(year: int, daily_map: Dict[str, float]) -> float:
+    s = dt.date(year, 1, 1)
+    e = dt.date(year, 12, 31)
+    return _sum_window(s, e, daily_map)
 
-def _anchor_for_year(anchor_mmdd: Tuple[int, int], year: int) -> dt.date:
-    m, d = anchor_mmdd
-    # clamp day to month length (handle Feb 29)
-    last = _last_day_of_month(year, m)
-    d2 = min(d, last.day)
-    return dt.date(year, m, d2)
+def _fit_gamma_from_samples(samples: List[float]):
+    """Return (p_zero, shape, scale, pos_samples, zero_samples). floc=0 for shape/scale."""
+    zeros = [x for x in samples if x <= 0.0]
+    pos   = [x for x in samples if x > 0.0]
+    n = len(samples)
+    p0 = (len(zeros) / n) if n else 0.0
+    if len(pos) >= 3:
+        shape, loc, scale = gamma_dist.fit(pos, floc=0)
+        return p0, float(shape), float(scale), pos, zeros
+    else:
+        return p0, None, None, pos, zeros
 
+def _gamma_spi_for_value(x: float, p0: float, shape: Optional[float], scale: Optional[float]):
+    """Return (spi, Gx, H). If insufficient shape/scale, returns (None, None, None)."""
+    if shape is None or scale is None:
+        return None, None, None
+    Gx = float(gamma_dist.cdf(max(x, 0.0), a=shape, loc=0, scale=scale))
+    H  = p0 + (1.0 - p0) * Gx
+    H  = min(max(H, 1e-10), 1.0 - 1e-10)
+    spi_val = float(norm.ppf(H))
+    return spi_val, Gx, H
+
+def _zscore(x: float, samples: List[float]) -> Optional[float]:
+    if len(samples) < 2:
+        return None
+    try:
+        mu = mean(samples)
+        sd = stdev(samples)
+    except Exception:
+        return None
+    if sd == 0:
+        return None
+    return (x - mu) / sd
+
+def _spi_category(spi: Optional[float]) -> str:
+    if spi is None:
+        return "Undefined"
+    if spi <= -2.0: return "Extreme drought"
+    if spi <= -1.5: return "Severe drought"
+    if spi <= -1.0: return "Moderate drought"
+    if spi <  1.0:  return "Near normal"
+    if spi <  1.5:  return "Moderately wet"
+    if spi <  2.0:  return "Very wet"
+    return "Extremely wet"
 
 # ------------------- SPI (auto, z-score / legacy) -------------------
 @app.get("/demo/spi_historical_auto")
@@ -224,7 +241,7 @@ def spi_historical_auto(
 
     # Baseline per-year window sums
     by0, by1 = _parse_baseline(baseline)
-    base_all = _fetch_power_precip(lat, lon, dt.date(by0, 1, 1), dt.date(by1, 12, 31))
+    base_all = _fetch_power_precip(lat, lon, dt.date(by0,1,1), dt.date(by1,12,31))
     baseline_sums = _aligned_baseline_window_sums(end, win, base_all, by0, by1)
 
     if len(baseline_sums) < 2:
@@ -252,7 +269,6 @@ def spi_historical_auto(
         "spi": round(spi_z, 3),
         "note": "Legacy demo using z-score SPI. Prefer /demo/spi_gamma_historical_auto for Gamma SPI.",
     }
-
 
 # --------- SPI (auto, Gamma fit with zero-precip adjustment) --------
 @app.get("/demo/spi_gamma_historical_auto")
@@ -282,7 +298,7 @@ def spi_gamma_historical_auto(
 
     # Baseline
     by0, by1 = _parse_baseline(baseline)
-    base_all = _fetch_power_precip(lat, lon, dt.date(by0, 1, 1), dt.date(by1, 12, 31))
+    base_all = _fetch_power_precip(lat, lon, dt.date(by0,1,1), dt.date(by1,12,31))
     baseline_sums = _aligned_baseline_window_sums(end, win, base_all, by0, by1)
 
     if len(baseline_sums) < 5:
@@ -348,243 +364,192 @@ def spi_gamma_historical_auto(
         "note": "SPI via 2-parameter Gamma fit on baseline window sums (zeros handled).",
     }
 
-
-# ---------------- SPI SERIES (monthly/yearly, anchor & aggregate) ----------------
+# ============== SPI SERIES (MONTHLY or YEARLY) ======================
 @app.get("/demo/spi_gamma_series")
 def spi_gamma_series(
     lat: float = Query(...),
     lon: float = Query(...),
     start_date: str = Query(..., description="YYYY-MM-DD"),
     end_date: str = Query(..., description="YYYY-MM-DD"),
-    window_days: int = Query(30, ge=7, le=120),
+    window_days: int = Query(30, ge=7, le=120, description="Used only for yearly_method='window'"),
     baseline: str = Query("1981-2010", description="e.g., 1981-2010"),
-    datasource: str = Query("era5", description="locked to era5 for demo"),
-    step: Literal["month", "year"] = Query("month", description="Series step: 'month' or 'year'"),
-    yearly_method: Literal["dec31", "aggregate"] = Query("dec31", description="Yearly mode: 'dec31' window or 'aggregate' from monthly SPI"),
-    anchor: Optional[str] = Query(None, description="Optional custom anchor date 'YYYY-MM-DD' (uses only MM-DD) for yearly dec31 method"),
+    datasource: str = Query("era5", description="demo-locked to ERA5"),
+    step: Literal["month","year"] = Query("year", description="Aggregate by 'month' or 'year'"),
+    yearly_method: Literal["total","window"] = Query("total", description="'total' = Jan–Dec totals, 'window' = trailing window ending on anchor"),
+    anchor_mm: int = Query(12, ge=1, le=12, description="If yearly_method='window', end-month of window (default Dec)"),
+    anchor_dd: int = Query(31, ge=1, le=31, description="If yearly_method='window', end-day of window (clamped)"),
 ):
-    """
-    Return SPI series using Gamma-fit (with zero handling) at chosen step:
-      - step='month': value per month (window ends on month-end) between start_date and end_date.
-      - step='year', yearly_method='dec31': one value per year with window ending at Dec-31 (or custom anchor MM-DD if provided).
-      - step='year', yearly_method='aggregate': compute monthly SPI first, then aggregate by year (mean/min and drought counts).
-    """
+    # Demo lock: only ERA5 in demo
     if DEMO_LOCK and datasource.lower() != ALLOWED_DATASOURCE:
         raise HTTPException(status_code=403, detail={"message": "Demo mode: ERA5 only for SPI series."})
 
     try:
         start = dt.date.fromisoformat(start_date)
-        end = dt.date.fromisoformat(end_date)
+        end   = dt.date.fromisoformat(end_date)
     except Exception:
         raise HTTPException(status_code=400, detail={"message": "Invalid start_date/end_date. Use YYYY-MM-DD."})
     if end < start:
         raise HTTPException(status_code=400, detail={"message": "end_date must be >= start_date."})
 
-    win = int(window_days)
-
-    # Fetch observations covering all needed windows
-    fetch_start = start - dt.timedelta(days=win - 1)
-    obs_all = _fetch_power_precip(lat, lon, fetch_start, end)
-
-    # Fetch baseline once (full years)
+    # Fetch observations & baseline once
+    obs_all  = _fetch_power_precip(lat, lon, dt.date(start.year, 1, 1), dt.date(end.year, 12, 31))
     by0, by1 = _parse_baseline(baseline)
-    base_all = _fetch_power_precip(lat, lon, dt.date(by0, 1, 1), dt.date(by1, 12, 31))
-
-    def _spi_for_end_date(ed: dt.date) -> Dict[str, Optional[float]]:
-        s = ed - dt.timedelta(days=win - 1)
-        obs_sum = _sum_window(s, ed, obs_all)
-        bl_sums = _aligned_baseline_window_sums(ed, win, base_all, by0, by1)
-        # Gamma with zero handling, fallback to z-score when needed
-        note = "gamma"
-        p0 = shape = scale = Gx = H = None
-        if len(bl_sums) < 5:
-            try:
-                sd = stdev(bl_sums)
-            except Exception:
-                sd = 0.0
-            if sd == 0:
-                return {
-                    "obs_sum_mm": round(obs_sum, 3),
-                    "spi": None,
-                    "method": "undefined-baseline",
-                    "p_zero": None,
-                    "gamma_shape": None,
-                    "gamma_scale": None,
-                    "cdf_gamma": None,
-                    "cdf_mixed": None,
-                }
-            mu = mean(bl_sums)
-            spi_val = (obs_sum - mu) / sd
-            return {
-                "obs_sum_mm": round(obs_sum, 3),
-                "spi": round(spi_val, 3),
-                "method": "zscore-fallback",
-                "p_zero": None,
-                "gamma_shape": None,
-                "gamma_scale": None,
-                "cdf_gamma": None,
-                "cdf_mixed": None,
-            }
-        zeros = [x for x in bl_sums if x <= 0.0]
-        pos = [x for x in bl_sums if x > 0.0]
-        n = len(bl_sums)
-        p0 = len(zeros) / n
-        if len(pos) < 3:
-            try:
-                sd = stdev(bl_sums)
-            except Exception:
-                sd = 0.0
-            if sd == 0:
-                return {
-                    "obs_sum_mm": round(obs_sum, 3),
-                    "spi": None,
-                    "method": "undefined-baseline",
-                    "p_zero": round(p0, 3),
-                    "gamma_shape": None,
-                    "gamma_scale": None,
-                    "cdf_gamma": None,
-                    "cdf_mixed": None,
-                }
-            mu = mean(bl_sums)
-            spi_val = (obs_sum - mu) / sd
-            return {
-                "obs_sum_mm": round(obs_sum, 3),
-                "spi": round(spi_val, 3),
-                "method": "zscore-fallback",
-                "p_zero": round(p0, 3),
-                "gamma_shape": None,
-                "gamma_scale": None,
-                "cdf_gamma": None,
-                "cdf_mixed": None,
-            }
-        # Gamma fit
-        shape, loc, scale = gamma_dist.fit(pos, floc=0)
-        Gx = float(gamma_dist.cdf(max(obs_sum, 0.0), a=shape, loc=0, scale=scale))
-        H = p0 + (1.0 - p0) * Gx
-        H = min(max(H, 1e-10), 1.0 - 1e-10)
-        spi_val = float(norm.ppf(H))
-        return {
-            "obs_sum_mm": round(obs_sum, 3),
-            "spi": round(spi_val, 3),
-            "method": note,
-            "p_zero": round(p0, 3),
-            "gamma_shape": round(shape, 6),
-            "gamma_scale": round(scale, 6),
-            "cdf_gamma": round(Gx, 6),
-            "cdf_mixed": round(H, 6),
-        }
+    base_all = _fetch_power_precip(lat, lon, dt.date(by0,1,1), dt.date(by1,12,31))
 
     if step == "month":
-        month_ends = _month_end_dates(start, end)
-        series: List[Dict] = []
-        for ed in month_ends:
-            out = _spi_for_end_date(ed)
+        # Baseline monthly totals per calendar month
+        baseline_month_samples = {m: [] for m in range(1,13)}
+        for y in range(by0, by1+1):
+            for m in range(1,13):
+                s = dt.date(y, m, 1)
+                e = dt.date(y, m, _last_day_of_month(y,m))
+                baseline_month_samples[m].append(_sum_window(s, e, base_all))
+
+        # Fit Gamma per month
+        month_params = {}
+        for m in range(1,13):
+            p0, shape, scale, pos, zeros = _fit_gamma_from_samples(baseline_month_samples[m])
+            month_params[m] = {"p_zero": p0, "shape": shape, "scale": scale, "n": len(baseline_month_samples[m])}
+
+        # Build series within requested range (full months only)
+        series = []
+        for (y, m) in _month_iter(start, end):
+            s = dt.date(y, m, 1)
+            e = dt.date(y, m, _last_day_of_month(y,m))
+            if (y == start.year and m == start.month and start != s) or (y == end.year and m == end.month and end != e):
+                continue
+            total = _sum_window(s, e, obs_all)
+            params = month_params[m]
+            spi_val, Gx, H = _gamma_spi_for_value(total, params["p_zero"], params["shape"], params["scale"])
+            if spi_val is None:
+                z = _zscore(total, baseline_month_samples[m])
+                spi_val = None if z is None else float(z)
+                Gx = H = None
             series.append({
-                "year": ed.year,
-                "month": ed.month,
-                "end_date": ed.isoformat(),
-                **out,
+                "year": y,
+                "month": m,
+                "end_date": e.isoformat(),
+                "total_mm": round(total, 3),
+                "spi": None if spi_val is None else round(spi_val, 3),
+                "category": _spi_category(spi_val),
+                "gamma_shape": None if params["shape"] is None else round(params["shape"], 6),
+                "gamma_scale": None if params["scale"] is None else round(params["scale"], 6),
+                "p_zero": round(params["p_zero"], 3),
+                "cdf_gamma": None if Gx is None else round(Gx, 6),
+                "cdf_mixed": None if H  is None else round(H, 6),
             })
+
         return {
-            "method": "gamma-series-month",
+            "method": "gamma-monthly",
             "datasource": datasource,
             "lat": lat, "lon": lon,
-            "window_days": win,
             "baseline": f"{by0}-{by1}",
-            "step": step,
             "count": len(series),
             "series": series,
-            "note": "SPI per month using window ending at each month-end between start and end.",
+            "note": "SPI per calendar month; gamma parameters estimated per month from baseline monthly totals.",
         }
 
-    # step == 'year'
-    if yearly_method == "aggregate":
-        # 1) compute monthly series across range
-        month_ends = _month_end_dates(start, end)
-        per_year: DefaultDict[int, List[float]] = defaultdict(list)
-        per_year_all: DefaultDict[int, List[Dict]] = defaultdict(list)
-        for ed in month_ends:
-            out = _spi_for_end_date(ed)
-            if out["spi"] is not None:
-                per_year[ed.year].append(out["spi"])  # SPI value only
-            per_year_all[ed.year].append({"end_date": ed.isoformat(), **out})
-        # 2) aggregate by year
-        annual: List[Dict] = []
-        for y in range(start.year, end.year + 1):
-            months = per_year_all.get(y, [])
-            vals = per_year.get(y, [])
-            if len(months) == 0:
-                continue
-            mean_spi = round(sum(vals) / len(vals), 3) if len(vals) else None
-            min_spi = round(min(vals), 3) if len(vals) else None
-            counts = {
-                "lt_-1.0": sum(1 for v in vals if v < -1.0),
-                "lt_-1.5": sum(1 for v in vals if v < -1.5),
-                "lt_-2.0": sum(1 for v in vals if v < -2.0),
-            }
-            annual.append({
+    # YEARLY
+    years = list(range(start.year, end.year + 1))
+
+    if yearly_method == "total":
+        # Annual Jan–Dec totals
+        baseline_annual = [_annual_sum(y, base_all) for y in range(by0, by1+1)]
+        p0, shape, scale, pos, zeros = _fit_gamma_from_samples(baseline_annual)
+        yearly_params = {
+            "p_zero": round(p0, 3),
+            "gamma_shape": None if shape is None else round(shape, 6),
+            "gamma_scale": None if scale is None else round(scale, 6),
+            "n_baseline": len(baseline_annual),
+        }
+        series = []
+        for y in years:
+            total = _annual_sum(y, obs_all)
+            spi_val, Gx, H = _gamma_spi_for_value(total, p0, shape, scale)
+            if spi_val is None:
+                z = _zscore(total, baseline_annual)
+                spi_val = None if z is None else float(z)
+                Gx = H = None
+            series.append({
                 "year": y,
-                "months": months,
-                "mean_spi": mean_spi,
-                "min_spi": min_spi,
-                "drought_counts": counts,
+                "end_date": dt.date(y,12,31).isoformat(),
+                "total_mm": round(total, 3),
+                "spi": None if spi_val is None else round(spi_val, 3),
+                "category": _spi_category(spi_val),
+                "cdf_gamma": None if Gx is None else round(Gx, 6),
+                "cdf_mixed": None if H  is None else round(H, 6),
             })
         return {
-            "method": "gamma-series-year-aggregate",
+            "method": "gamma-yearly-total",
             "datasource": datasource,
             "lat": lat, "lon": lon,
-            "window_days": win,
             "baseline": f"{by0}-{by1}",
-            "step": "year",
-            "yearly_method": yearly_method,
-            "count": len(annual),
-            "series": annual,
-            "note": "Yearly aggregation from monthly SPI: mean/min and drought-month counts.",
+            "yearly_params": yearly_params,
+            "count": len(series),
+            "series": series,
+            "note": "SPI per calendar year using annual (Jan–Dec) totals; one gamma fit on baseline annual totals.",
         }
 
-    # yearly_method == 'dec31' (or custom anchor)
-    if anchor:
-        try:
-            anc = dt.date.fromisoformat(anchor)
-            anchor_mmdd = (anc.month, anc.day)
-        except Exception:
-            raise HTTPException(status_code=400, detail={"message": "Invalid anchor. Use YYYY-MM-DD (MM-DD part used)."})
-    else:
-        anchor_mmdd = (12, 31)
-
-    years = list(range(start.year, end.year + 1))
-    year_ends: List[dt.date] = []
+    # Yearly trailing window (legacy-compatible)
+    win = int(window_days)
+    series = []
     for y in years:
-        ed = _anchor_for_year(anchor_mmdd, y)
-        if ed < start or ed > end:
-            continue
-        year_ends.append(ed)
-    if not year_ends:
-        raise HTTPException(status_code=400, detail={"message": "No anchor dates inside the range for yearly series."})
-
-    series: List[Dict] = []
-    for ed in year_ends:
-        out = _spi_for_end_date(ed)
+        last_day = calendar.monthrange(y, anchor_mm)[1]
+        dd = min(anchor_dd, last_day)
+        ed = dt.date(y, anchor_mm, dd)
+        st = ed - dt.timedelta(days=win - 1)
+        total = _sum_window(st, ed, obs_all)
+        bl_sums = _aligned_baseline_window_sums(ed, win, base_all, by0, by1)
+        p0, shape, scale, pos, zeros = _fit_gamma_from_samples(bl_sums)
+        spi_val, Gx, H = _gamma_spi_for_value(total, p0, shape, scale)
+        if spi_val is None:
+            z = _zscore(total, bl_sums)
+            spi_val = None if z is None else float(z)
+            Gx = H = None
         series.append({
-            "year": ed.year,
+            "year": y,
             "end_date": ed.isoformat(),
-            **out,
+            "window_days": win,
+            "total_mm": round(total, 3),
+            "spi": None if spi_val is None else round(spi_val, 3),
+            "category": _spi_category(spi_val),
+            "gamma_shape": None if shape is None else round(shape, 6),
+            "gamma_scale": None if scale is None else round(scale, 6),
+            "p_zero": round(p0, 3),
+            "cdf_gamma": None if Gx is None else round(Gx, 6),
+            "cdf_mixed": None if H  is None else round(H, 6),
         })
 
     return {
-        "method": "gamma-series-year-anchor",
+        "method": "gamma-yearly-window",
         "datasource": datasource,
         "lat": lat, "lon": lon,
-        "window_days": win,
         "baseline": f"{by0}-{by1}",
-        "step": "year",
-        "yearly_method": yearly_method,
-        "anchor": f"{anchor_mmdd[0]:02d}-{anchor_mmdd[1]:02d}",
+        "anchor_mm": anchor_mm,
+        "anchor_dd": anchor_dd,
+        "window_days": win,
         "count": len(series),
         "series": series,
-        "note": "One SPI per year; window ends on custom anchor (default Dec-31).",
+        "note": "SPI per year using trailing window ending on anchor; gamma fit computed per year from baseline-aligned windows.",
     }
 
+# ============== Convenience: get BOTH monthly & yearly ==============
+@app.get("/demo/spi_gamma_both")
+def spi_gamma_both(
+    lat: float = Query(...),
+    lon: float = Query(...),
+    start_date: str = Query(..., description="YYYY-MM-DD"),
+    end_date: str = Query(..., description="YYYY-MM-DD"),
+    baseline: str = Query("1981-2010"),
+    datasource: str = Query("era5"),
+):
+    monthly = spi_gamma_series(lat=lat, lon=lon, start_date=start_date, end_date=end_date,
+                               window_days=30, baseline=baseline, datasource=datasource,
+                               step="month", yearly_method="total")  # yearly_method ignored for month
+    yearly  = spi_gamma_series(lat=lat, lon=lon, start_date=start_date, end_date=end_date,
+                               window_days=30, baseline=baseline, datasource=datasource,
+                               step="year",  yearly_method="total")
+    return {"monthly": monthly, "yearly": yearly}
 
 # ---------------------- Disabled (demo) routes ---------------------
 @app.get("/indices/spei")
@@ -595,7 +560,6 @@ def spei_disabled():
             "enable_hint": "Set DEMO_LOCK=0 in environment to enable full endpoints (once implemented)."
         })
     raise HTTPException(status_code=501, detail="SPEI not implemented yet.")
-
 
 @app.get("/forecast/next7")
 def fcst_next7_disabled():
