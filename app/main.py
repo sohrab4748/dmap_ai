@@ -194,6 +194,134 @@ def spi_historical_auto(
         "spi": round(spi_z, 3),
         "note": "Legacy demo using z-score SPI. Prefer /demo/spi_gamma_historical_auto for Gamma SPI.",
     }
+from typing import Literal
+
+@app.get("/demo/spi_gamma_series")
+def spi_gamma_series(
+    lat: float = Query(...),
+    lon: float = Query(...),
+    start_date: str = Query(..., description="YYYY-MM-DD"),
+    end_date: str = Query(..., description="YYYY-MM-DD"),
+    window_days: int = Query(30, ge=7, le=120),
+    baseline: str = Query("1981-2010", description="e.g., 1981-2010"),
+    datasource: str = Query("era5", description="locked to era5 for demo"),
+    step: Literal["year"] = Query("year", description="Currently supports 'year' for 1 value per year"),
+):
+    """
+    Return a SPI time series using Gamma fit for each *year* between start_date and end_date.
+    For step='year', we compute one SPI per year using the window ending on Dec 31 of that year.
+    """
+    # Demo lock: only ERA5 path (implicitly historical + point)
+    if DEMO_LOCK and datasource.lower() != ALLOWED_DATASOURCE:
+        raise HTTPException(status_code=403, detail={"message": "Demo mode: ERA5 only for SPI series."})
+
+    try:
+        start = dt.date.fromisoformat(start_date)
+        end   = dt.date.fromisoformat(end_date)
+    except Exception:
+        raise HTTPException(status_code=400, detail={"message": "Invalid start_date/end_date. Use YYYY-MM-DD."})
+
+    if end < start:
+        raise HTTPException(status_code=400, detail={"message": "end_date must be >= start_date."})
+
+    # Build list of yearly endpoints (Dec 31 each year)
+    def _last_day_of_year(y: int) -> dt.date:
+        return dt.date(y, 12, 31)
+
+    years = list(range(start.year, end.year + 1))
+    year_ends = [_last_day_of_year(y) for y in years if _last_day_of_year(y) >= start and _last_day_of_year(y) <= end]
+    if not year_ends:
+        raise HTTPException(status_code=400, detail={"message": "No whole years inside the range for step='year'."})
+
+    win = int(window_days)
+
+    # Fetch observations once for the whole span
+    obs_all = _fetch_power_precip(lat, lon, dt.date(start.year, 1, 1), end)
+
+    # Fetch baseline once for all years in baseline period
+    by0, by1 = _parse_baseline(baseline)
+    base_all = _fetch_power_precip(lat, lon, dt.date(by0,1,1), dt.date(by1,12,31))
+
+    series = []
+    for ed in year_ends:
+        s = ed - dt.timedelta(days=win - 1)
+        obs_sum = _sum_window(s, ed, obs_all)
+
+        # Per-year-aligned baseline window sums for this end date
+        bl_sums = _aligned_baseline_window_sums(ed, win, base_all, by0, by1)
+        if len(bl_sums) < 5:
+            # very short baseline -> z-score fallback
+            try:
+                sd = stdev(bl_sums)
+            except Exception:
+                sd = 0.0
+            if sd == 0:
+                spi_val = None
+                note = "No variance in baseline; SPI undefined."
+                p0 = None; shape = None; scale = None; Gx = None; H = None
+            else:
+                mu = mean(bl_sums)
+                spi_val = (obs_sum - mu) / sd
+                note = "z-score fallback (insufficient positive samples for Gamma)."
+                p0 = None; shape = None; scale = None; Gx = None; H = None
+        else:
+            zeros = [x for x in bl_sums if x <= 0.0]
+            pos   = [x for x in bl_sums if x > 0.0]
+            n     = len(bl_sums)
+            p0    = len(zeros) / n if n else 0.0
+
+            if len(pos) < 3:
+                # z-score fallback
+                try:
+                    sd = stdev(bl_sums)
+                except Exception:
+                    sd = 0.0
+                if sd == 0:
+                    spi_val = None
+                    note = "No variance in baseline; SPI undefined."
+                    shape = scale = Gx = H = None
+                else:
+                    mu = mean(bl_sums)
+                    spi_val = (obs_sum - mu) / sd
+                    note = "z-score fallback (insufficient positive samples for Gamma)."
+                    shape = scale = Gx = H = None
+            else:
+                shape, loc, scale = gamma_dist.fit(pos, floc=0)
+                Gx = float(gamma_dist.cdf(max(obs_sum, 0.0), a=shape, loc=0, scale=scale))
+                H  = p0 + (1.0 - p0) * Gx
+                H  = min(max(H, 1e-10), 1.0 - 1e-10)
+                spi_val = float(norm.ppf(H))
+                note = "gamma"
+
+        series.append({
+            "end_date": ed.isoformat(),
+            "obs_sum_mm": round(obs_sum, 3),
+            "spi": None if spi_val is None else round(spi_val, 3),
+            "method": note,
+            "p_zero": None if p0 is None else round(p0, 3),
+            "gamma_shape": None if 'shape' not in locals() or shape is None else round(shape, 6),
+            "gamma_scale": None if 'scale' not in locals() or scale is None else round(scale, 6),
+            "cdf_gamma": None if 'Gx' not in locals() or Gx is None else round(Gx, 6),
+            "cdf_mixed": None if 'H'  not in locals() or H  is None else round(H, 6),
+        })
+
+        # clear per-iteration locals to avoid accidental carry-over
+        if 'shape' in locals(): del shape
+        if 'scale' in locals(): del scale
+        if 'Gx' in locals(): del Gx
+        if 'H' in locals(): del H
+
+    return {
+        "method": "gamma-series",
+        "datasource": datasource,
+        "lat": lat, "lon": lon,
+        "window_days": win,
+        "baseline": f"{by0}-{by1}",
+        "step": step,
+        "count": len(series),
+        "series": series,
+        "note": "One SPI per year using 30-day window ending Dec 31 each year within the range."
+    }
 
 # --------- SPI (auto, Gamma fit with zero-precip adjustment) --------
 @app.get("/demo/spi_gamma_historical_auto")
