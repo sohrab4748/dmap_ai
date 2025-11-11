@@ -13,7 +13,7 @@ from typing import Optional, Tuple, Dict, List
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware 
 
 # SciPy for Gamma CDF and Normal inverse CDF
 from scipy.stats import gamma as gamma_dist, norm
