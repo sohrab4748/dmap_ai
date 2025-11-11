@@ -4,7 +4,14 @@ from fastapi import FastAPI, HTTPException, Query
 from typing import Optional
 
 app = FastAPI(title="DMAP-AI API", version="0.2.0")
-
+# allow your web origins (use "*" for now, tighten later)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],           # e.g. ["https://dmap.agrimetsoft.com"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # --- DEMO LOCK CONFIG ---
 DEMO_LOCK = os.getenv("DEMO_LOCK", "1") == "1"          # set to "0" to disable restrictions
 ALLOWED_MODE = os.getenv("DEMO_MODE", "historical").lower()
