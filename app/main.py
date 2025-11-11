@@ -1,45 +1,89 @@
 # app/main.py
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
 import os
+from fastapi import FastAPI, HTTPException, Query
+from typing import Optional
 
-app = FastAPI(title="DMAP-AI API", version="0.1.0")
+app = FastAPI(title="DMAP-AI API", version="0.2.0")
 
-# CORS: allow your sites (set ALLOW_ORIGINS in Render → Environment)
-origins = [o.strip() for o in os.getenv("ALLOW_ORIGINS","").split(",") if o.strip()] or ["*"]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"])
+# --- DEMO LOCK CONFIG ---
+DEMO_LOCK = os.getenv("DEMO_LOCK", "1") == "1"          # set to "0" to disable restrictions
+ALLOWED_MODE = os.getenv("DEMO_MODE", "historical").lower()
+ALLOWED_AOI = os.getenv("DEMO_AOI", "point").lower()
+ALLOWED_DATASOURCE = os.getenv("DEMO_DATASOURCE", "era5").lower()
 
-@app.get("/", tags=["meta"])
-def home():
-    return {"service": "DMAP-AI API", "status": "live"}
 
-@app.get("/health", tags=["meta"])
+@app.get("/")
+def root():
+    return {"ok": True, "message": "DMAP-AI API. See /health and /docs", "demo_lock": DEMO_LOCK}
+
+
+@app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "demo_lock": DEMO_LOCK}
 
-@app.get("/indices/spi", tags=["indices"])
+
+# ---------- SPI (ALLOWED IN DEMO) ----------
+@app.get("/indices/spi")
 def spi(
-    sum_rain_mm: float,
-    clim_mean_mm: float,
-    clim_std_mm: float,
-    window_days: int = Query(30, enum=[7, 30, 90], description="Length of window")
+    sum_rain_mm: float = Query(..., description="Aggregated precipitation for the window (mm)"),
+    clim_mean_mm: float = Query(..., description="Climatological mean for the same window (mm)"),
+    clim_std_mm: float = Query(..., description="Climatological std for the same window (mm)", gt=0),
+    window_days: int = Query(30, ge=1, le=365, description="Window length (days)"),
+    # Optional flags so the UI can pass what the user selected (we enforce them in demo)
+    mode: Optional[str] = Query(None, description="historical|prediction"),
+    aoi: Optional[str] = Query(None, description="point|box"),
+    datasource: Optional[str] = Query(None, description="era5|gridmet|prism|gpm|user")
 ):
-    std = clim_std_mm or 1e-6
-    spi = (sum_rain_mm - clim_mean_mm) / std
-    return {"window_days": window_days, "sum_mm": sum_rain_mm, "spi": spi}
+    if DEMO_LOCK:
+        # Enforce: ONLY historical + point + era5
+        if mode is not None and mode.lower() != ALLOWED_MODE:
+            raise HTTPException(status_code=403, detail={
+                "message": "Demo mode: only 'historical' is enabled.",
+                "allowed": {"mode": ALLOWED_MODE, "aoi": ALLOWED_AOI, "datasource": ALLOWED_DATASOURCE}
+            })
+        if aoi is not None and aoi.lower() != ALLOWED_AOI:
+            raise HTTPException(status_code=403, detail={
+                "message": "Demo mode: only 'point' AOI is enabled.",
+                "allowed": {"mode": ALLOWED_MODE, "aoi": ALLOWED_AOI, "datasource": ALLOWED_DATASOURCE}
+            })
+        if datasource is not None and datasource.lower() != ALLOWED_DATASOURCE:
+            raise HTTPException(status_code=403, detail={
+                "message": "Demo mode: only 'ERA5' datasource is enabled.",
+                "allowed": {"mode": ALLOWED_MODE, "aoi": ALLOWED_AOI, "datasource": ALLOWED_DATASOURCE}
+            })
 
-@app.get("/indices/spei", tags=["indices"])
-def spei(
-    p_sum: float,
-    pet_sum: float,
-    clim_mean: float,   # climatology mean of (P - PET) for this window
-    clim_std: float,    # climatology std of (P - PET) for this window
-    window_days: int = Query(30, enum=[7, 30, 90], description="Length of window")
-):
-    deficit = p_sum - pet_sum
-    z = (deficit - clim_mean) / (clim_std or 1e-6)
-    return {"window_days": window_days, "deficit": deficit, "spei": z}
+    # Minimal SPI (z-score) using mean/std — good enough for demo wiring.
+    spi_value = (sum_rain_mm - clim_mean_mm) / clim_std_mm
 
-@app.get("/forecast/next7", tags=["forecast"])
-def next7(prob: float = 0.42, severity: float = -1.1):
-    return {"horizon_days": 7, "prob": prob, "severity": severity, "why": ["low rain", "high PET"]}
+    return {
+        "window_days": window_days,
+        "sum_mm": sum_rain_mm,
+        "clim_mean_mm": clim_mean_mm,
+        "clim_std_mm": clim_std_mm,
+        "spi": round(spi_value, 3),
+        "demo_lock": DEMO_LOCK,
+        "note": "Demo mode is enforcing historical+point+ERA5. Full gamma-fit SPI will be in the production build."
+    }
+
+
+# ---------- SPEI (DISABLED IN DEMO) ----------
+@app.get("/indices/spei")
+def spei_disabled():
+    if DEMO_LOCK:
+        raise HTTPException(status_code=403, detail={
+            "message": "Demo mode: SPEI endpoint is disabled. SPI-only is enabled for historical+point+ERA5.",
+            "enable_hint": "Set DEMO_LOCK=0 in environment to enable full endpoints (once implemented)."
+        })
+    # (Your real SPEI implementation would go here when demo lock is off)
+    raise HTTPException(status_code=501, detail="SPEI not implemented yet.")
+
+
+# ---------- FORECASTS (DISABLED IN DEMO) ----------
+@app.get("/forecast/next7")
+def fcst_next7_disabled():
+    if DEMO_LOCK:
+        raise HTTPException(status_code=403, detail={
+            "message": "Demo mode: forecast endpoints are disabled.",
+            "enable_hint": "Set DEMO_LOCK=0 to enable once forecasts are ready."
+        })
+    raise HTTPException(status_code=501, detail="Forecasts not implemented yet.")
