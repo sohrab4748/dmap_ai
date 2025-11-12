@@ -33,6 +33,7 @@ from typing import Optional, Tuple, Dict, List, Literal
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional, Literal
 
 # SciPy for Gamma CDF and Normal inverse CDF
 from scipy.stats import gamma as gamma_dist, norm
@@ -388,18 +389,22 @@ def spi_gamma_series(
     lon: float = Query(...),
     start_date: str = Query(..., description="YYYY-MM-DD"),
     end_date: str = Query(..., description="YYYY-MM-DD"),
-    window_days: int = Query(30, ge=7, le=120, description="Used only for yearly_method='window'"),
+    # NOTE: now OPTIONAL; validated only when yearly_method='window'
+    window_days: Optional[int] = Query(None, description="Only for yearly_method='window'"),
     baseline: str = Query("1981-2010", description="e.g., 1981-2010"),
     datasource: str = Query("era5", description="demo-locked to ERA5"),
-    step: Literal["month","year"] = Query("year", description="Aggregate by 'month' or 'year'"),
-    yearly_method: Literal["total","window"] = Query("total", description="'total' = Jan–Dec totals, 'window' = trailing window ending on anchor"),
-    anchor_mm: int = Query(12, ge=1, le=12, description="If yearly_method='window', end-month of window (default Dec)"),
-    anchor_dd: int = Query(31, ge=1, le=31, description="If yearly_method='window', end-day of window (clamped)"),
+    step: Literal["month","year"] = Query("year", description="Aggregate by calendar 'month' or 'year'"),
+    yearly_method: Literal["total","window"] = Query("total", description="'total'=Jan–Dec totals; 'window'=rolling window"),
+    # accept either MM/DD ints or a single 'anchor=MM-DD' string (frontend-friendly)
+    anchor_mm: int = Query(12, ge=1, le=12, description="End-month when yearly_method='window'"),
+    anchor_dd: int = Query(31, ge=1, le=31, description="End-day (clamped) when yearly_method='window'"),
+    anchor: Optional[str] = Query(None, description="Optional 'MM-DD' string; overrides anchor_mm/dd if given"),
 ):
-    # Demo lock: only ERA5 in demo
+    # Demo lock: ERA5 only
     if DEMO_LOCK and datasource.lower() != ALLOWED_DATASOURCE:
         raise HTTPException(status_code=403, detail={"message": "Demo mode: ERA5 only for SPI series."})
 
+    # parse dates
     try:
         start = dt.date.fromisoformat(start_date)
         end   = dt.date.fromisoformat(end_date)
@@ -408,13 +413,23 @@ def spi_gamma_series(
     if end < start:
         raise HTTPException(status_code=400, detail={"message": "end_date must be >= start_date."})
 
-    # Fetch observations & baseline once
+    # optional 'anchor=MM-DD'
+    if anchor:
+        try:
+            mm_s, dd_s = anchor.split("-")
+            anchor_mm = max(1, min(12, int(mm_s)))
+            anchor_dd = max(1, min(31, int(dd_s)))
+        except Exception:
+            pass  # keep defaults if parsing fails
+
+    # fetch obs & baseline once
     obs_all  = _fetch_power_precip(lat, lon, dt.date(start.year, 1, 1), dt.date(end.year, 12, 31))
     by0, by1 = _parse_baseline(baseline)
     base_all = _fetch_power_precip(lat, lon, dt.date(by0,1,1), dt.date(by1,12,31))
 
+    # ---------- MONTHLY ----------
     if step == "month":
-        # Baseline monthly totals per calendar month
+        # build baseline monthly totals (per calendar month)
         baseline_month_samples = {m: [] for m in range(1,13)}
         for y in range(by0, by1+1):
             for m in range(1,13):
@@ -422,30 +437,32 @@ def spi_gamma_series(
                 e = dt.date(y, m, _last_day_of_month(y,m))
                 baseline_month_samples[m].append(_sum_window(s, e, base_all))
 
-        # Fit Gamma per month
+        # fit gamma per month
         month_params = {}
         for m in range(1,13):
             p0, shape, scale, pos, zeros = _fit_gamma_from_samples(baseline_month_samples[m])
             month_params[m] = {"p_zero": p0, "shape": shape, "scale": scale, "n": len(baseline_month_samples[m])}
 
-        # Build series within requested range (full months only)
+        # series over full months in range
         series = []
-        for (y, m) in _month_iter(start, end):
+        for y, m in _month_iter(start, end):
             s = dt.date(y, m, 1)
             e = dt.date(y, m, _last_day_of_month(y,m))
+            # skip partial edge months
             if (y == start.year and m == start.month and start != s) or (y == end.year and m == end.month and end != e):
                 continue
-            total = _sum_window(s, e, obs_all)
+            tot = _sum_window(s, e, obs_all)
             params = month_params[m]
-            spi_val, Gx, H = _gamma_spi_for_value(total, params["p_zero"], params["shape"], params["scale"])
+            spi_val, Gx, H = _gamma_spi_for_value(tot, params["p_zero"], params["shape"], params["scale"])
             if spi_val is None:
-                z = _zscore(total, baseline_month_samples[m])
+                z = _zscore(tot, baseline_month_samples[m])
                 spi_val = None if z is None else float(z)
                 Gx = H = None
-            item = {
-                "year": y,
-                "month": m,
-                "end_date": e.isoformat(),
+
+            ws = round(tot, 3)  # consistent sum field
+            series.append({
+                "year": y, "month": m, "end_date": e.isoformat(),
+                "window_sum_mm": ws, "total_mm": ws, "obs_sum_mm": ws,
                 "spi": None if spi_val is None else round(spi_val, 3),
                 "category": _spi_category(spi_val),
                 "gamma_shape": None if params["shape"] is None else round(params["shape"], 6),
@@ -453,82 +470,83 @@ def spi_gamma_series(
                 "p_zero": round(params["p_zero"], 3),
                 "cdf_gamma": None if Gx is None else round(Gx, 6),
                 "cdf_mixed": None if H  is None else round(H, 6),
-            }
-            _add_sum_aliases(item, total)
-            series.append(item)
+            })
 
         return {
             "method": "gamma-monthly",
-            "datasource": datasource,
-            "lat": lat, "lon": lon,
+            "datasource": datasource, "lat": lat, "lon": lon,
             "baseline": f"{by0}-{by1}",
-            "count": len(series),
-            "series": series,
-            "note": "SPI per calendar month; gamma parameters estimated per month from baseline monthly totals.",
+            "count": len(series), "series": series,
+            "note": "SPI per calendar month using baseline-fitted Gamma per month.",
         }
 
-    # YEARLY
+    # ---------- YEARLY ----------
     years = list(range(start.year, end.year + 1))
 
     if yearly_method == "total":
-        # Annual Jan–Dec totals
+        # Jan–Dec totals (no window_days validation)
         baseline_annual = [_annual_sum(y, base_all) for y in range(by0, by1+1)]
         p0, shape, scale, pos, zeros = _fit_gamma_from_samples(baseline_annual)
-        yearly_params = {
-            "p_zero": round(p0, 3),
-            "gamma_shape": None if shape is None else round(shape, 6),
-            "gamma_scale": None if scale is None else round(scale, 6),
-            "n_baseline": len(baseline_annual),
-        }
+
         series = []
         for y in years:
-            total = _annual_sum(y, obs_all)
-            spi_val, Gx, H = _gamma_spi_for_value(total, p0, shape, scale)
+            tot = _annual_sum(y, obs_all)
+            spi_val, Gx, H = _gamma_spi_for_value(tot, p0, shape, scale)
             if spi_val is None:
-                z = _zscore(total, baseline_annual)
+                z = _zscore(tot, baseline_annual)
                 spi_val = None if z is None else float(z)
                 Gx = H = None
-            item = {
-                "year": y,
-                "end_date": dt.date(y,12,31).isoformat(),
+
+            ws = round(tot, 3)
+            series.append({
+                "year": y, "end_date": dt.date(y,12,31).isoformat(),
+                "window_sum_mm": ws, "total_mm": ws, "obs_sum_mm": ws,
                 "spi": None if spi_val is None else round(spi_val, 3),
                 "category": _spi_category(spi_val),
                 "cdf_gamma": None if Gx is None else round(Gx, 6),
                 "cdf_mixed": None if H  is None else round(H, 6),
-            }
-            _add_sum_aliases(item, total)
-            series.append(item)
+            })
+
         return {
             "method": "gamma-yearly-total",
-            "datasource": datasource,
-            "lat": lat, "lon": lon,
+            "datasource": datasource, "lat": lat, "lon": lon,
             "baseline": f"{by0}-{by1}",
-            "yearly_params": yearly_params,
-            "count": len(series),
-            "series": series,
-            "note": "SPI per calendar year using annual (Jan–Dec) totals; one gamma fit on baseline annual totals.",
+            "count": len(series), "series": series,
+            "note": "SPI per calendar year (Jan–Dec totals). 'window_days' is ignored here.",
         }
 
-    # Yearly trailing window (legacy-compatible)
-    win = int(window_days)
+    # yearly rolling window -> validate window_days now
+    win = window_days if window_days is not None else 30
+    if win < 7 or win > 120:
+        raise HTTPException(status_code=422, detail=[{
+            "type": "less_than_equal",
+            "loc": ["query","window_days"],
+            "msg": "For yearly_method='window', window_days must be between 7 and 120",
+            "input": str(window_days),
+            "ctx": {"ge": 7, "le": 120}
+        }])
+
     series = []
     for y in years:
         last_day = calendar.monthrange(y, anchor_mm)[1]
         dd = min(anchor_dd, last_day)
         ed = dt.date(y, anchor_mm, dd)
         st = ed - dt.timedelta(days=win - 1)
-        total = _sum_window(st, ed, obs_all)
+        tot = _sum_window(st, ed, obs_all)
+
         bl_sums = _aligned_baseline_window_sums(ed, win, base_all, by0, by1)
         p0, shape, scale, pos, zeros = _fit_gamma_from_samples(bl_sums)
-        spi_val, Gx, H = _gamma_spi_for_value(total, p0, shape, scale)
+        spi_val, Gx, H = _gamma_spi_for_value(tot, p0, shape, scale)
         if spi_val is None:
-            z = _zscore(total, bl_sums)
+            z = _zscore(tot, bl_sums)
             spi_val = None if z is None else float(z)
             Gx = H = None
-        item = {
-            "year": y,
-            "end_date": ed.isoformat(),
+
+        ws = round(tot, 3)
+        series.append({
+            "year": y, "end_date": ed.isoformat(),
             "window_days": win,
+            "window_sum_mm": ws, "total_mm": ws, "obs_sum_mm": ws,
             "spi": None if spi_val is None else round(spi_val, 3),
             "category": _spi_category(spi_val),
             "gamma_shape": None if shape is None else round(shape, 6),
@@ -536,22 +554,18 @@ def spi_gamma_series(
             "p_zero": round(p0, 3),
             "cdf_gamma": None if Gx is None else round(Gx, 6),
             "cdf_mixed": None if H  is None else round(H, 6),
-        }
-        _add_sum_aliases(item, total)
-        series.append(item)
+        })
 
     return {
         "method": "gamma-yearly-window",
-        "datasource": datasource,
-        "lat": lat, "lon": lon,
+        "datasource": datasource, "lat": lat, "lon": lon,
         "baseline": f"{by0}-{by1}",
-        "anchor_mm": anchor_mm,
-        "anchor_dd": anchor_dd,
+        "anchor_mm": anchor_mm, "anchor_dd": anchor_dd,
         "window_days": win,
-        "count": len(series),
-        "series": series,
-        "note": "SPI per year using trailing window ending on anchor; gamma fit computed per year from baseline-aligned windows.",
+        "count": len(series), "series": series,
+        "note": "SPI per year using rolling N-day window ending on anchor date.",
     }
+
 
 # ============== Convenience endpoints (avoid 404s) ==================
 @app.get("/demo/spi_gamma_series_monthly")
