@@ -1,17 +1,27 @@
 """
 DMAP-AI API (demo-locked)
-Adds SPI monthly & yearly Gamma series and a convenience endpoint.
+Adds SPI monthly & yearly Gamma series and convenience endpoints.
 
 Endpoints
 ---------
-• GET /                     — info
-• GET /health               — health
-• GET /indices/spi          — z-score SPI from user-provided sum/mean/std
-• GET /demo/spi_historical_auto           — legacy z-score SPI using NASA POWER
-• GET /demo/spi_gamma_historical_auto     — single Gamma SPI on trailing window
-• GET /demo/spi_gamma_series              — NEW: SPI series (step=month|year)
-• GET /demo/spi_gamma_both                — NEW: returns {monthly, yearly}
-• GET /indices/spei, /forecast/next7      — disabled in demo
+• GET /                               — info
+• GET /health                         — health
+• GET /indices/spi                    — z-score SPI from user-provided sum/mean/std
+• GET /demo/spi_historical_auto       — legacy z-score SPI using NASA POWER
+• GET /demo/spi_gamma_historical_auto — single Gamma SPI on trailing window
+• GET /demo/spi_gamma_series          — SPI series (step=month|year; yearly_method=total|window)
+• GET /demo/spi_gamma_series_monthly  — Convenience (calls series with step=month)
+• GET /demo/spi_gamma_series_yearly   — Convenience (calls series with step=year)
+• GET /demo/spi_gamma_both            — Returns {monthly, yearly}
+• GET /indices/spei, /forecast/next7  — disabled in demo
+
+Notes
+-----
+• For series items we now emit **window_sum_mm**, and also include aliases
+  **total_mm** and **obs_sum_mm** for frontend compatibility.
+• Yearly “total” means Jan–Dec annual precipitation totals (no window_days sent).
+• Yearly “window” uses a rolling N-day trailing window ending on an anchor date
+  in each year (N is capped at 120 for demo performance).
 """
 
 import os
@@ -27,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # SciPy for Gamma CDF and Normal inverse CDF
 from scipy.stats import gamma as gamma_dist, norm
 
-app = FastAPI(title="DMAP-AI API", version="0.7.0")
+app = FastAPI(title="DMAP-AI API", version="0.8.0")
 
 # ----------------------------- CORS ---------------------------------
 app.add_middleware(
@@ -110,6 +120,7 @@ def _parse_baseline(baseline: str) -> Tuple[int, int]:
         return (1981, 2010)
 
 def _fetch_power_precip(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
+    # NOTE: For demo we use NASA POWER daily precip. UI may show 'ERA5' but demo fetches POWER.
     params = {
         "parameters": POWER_PARAM,
         "community": "AG",
@@ -214,6 +225,12 @@ def _spi_category(spi: Optional[float]) -> str:
     if spi <  1.5:  return "Moderately wet"
     if spi <  2.0:  return "Very wet"
     return "Extremely wet"
+
+def _add_sum_aliases(d: Dict, val: float):
+    """Ensure all expected sum keys are present for frontend compatibility."""
+    d["window_sum_mm"] = round(val, 3)
+    d["obs_sum_mm"] = round(val, 3)
+    d["total_mm"] = round(val, 3)
 
 # ------------------- SPI (auto, z-score / legacy) -------------------
 @app.get("/demo/spi_historical_auto")
@@ -425,11 +442,10 @@ def spi_gamma_series(
                 z = _zscore(total, baseline_month_samples[m])
                 spi_val = None if z is None else float(z)
                 Gx = H = None
-            series.append({
+            item = {
                 "year": y,
                 "month": m,
                 "end_date": e.isoformat(),
-                "total_mm": round(total, 3),
                 "spi": None if spi_val is None else round(spi_val, 3),
                 "category": _spi_category(spi_val),
                 "gamma_shape": None if params["shape"] is None else round(params["shape"], 6),
@@ -437,7 +453,9 @@ def spi_gamma_series(
                 "p_zero": round(params["p_zero"], 3),
                 "cdf_gamma": None if Gx is None else round(Gx, 6),
                 "cdf_mixed": None if H  is None else round(H, 6),
-            })
+            }
+            _add_sum_aliases(item, total)
+            series.append(item)
 
         return {
             "method": "gamma-monthly",
@@ -470,15 +488,16 @@ def spi_gamma_series(
                 z = _zscore(total, baseline_annual)
                 spi_val = None if z is None else float(z)
                 Gx = H = None
-            series.append({
+            item = {
                 "year": y,
                 "end_date": dt.date(y,12,31).isoformat(),
-                "total_mm": round(total, 3),
                 "spi": None if spi_val is None else round(spi_val, 3),
                 "category": _spi_category(spi_val),
                 "cdf_gamma": None if Gx is None else round(Gx, 6),
                 "cdf_mixed": None if H  is None else round(H, 6),
-            })
+            }
+            _add_sum_aliases(item, total)
+            series.append(item)
         return {
             "method": "gamma-yearly-total",
             "datasource": datasource,
@@ -506,11 +525,10 @@ def spi_gamma_series(
             z = _zscore(total, bl_sums)
             spi_val = None if z is None else float(z)
             Gx = H = None
-        series.append({
+        item = {
             "year": y,
             "end_date": ed.isoformat(),
             "window_days": win,
-            "total_mm": round(total, 3),
             "spi": None if spi_val is None else round(spi_val, 3),
             "category": _spi_category(spi_val),
             "gamma_shape": None if shape is None else round(shape, 6),
@@ -518,7 +536,9 @@ def spi_gamma_series(
             "p_zero": round(p0, 3),
             "cdf_gamma": None if Gx is None else round(Gx, 6),
             "cdf_mixed": None if H  is None else round(H, 6),
-        })
+        }
+        _add_sum_aliases(item, total)
+        series.append(item)
 
     return {
         "method": "gamma-yearly-window",
@@ -532,6 +552,43 @@ def spi_gamma_series(
         "series": series,
         "note": "SPI per year using trailing window ending on anchor; gamma fit computed per year from baseline-aligned windows.",
     }
+
+# ============== Convenience endpoints (avoid 404s) ==================
+@app.get("/demo/spi_gamma_series_monthly")
+def spi_gamma_series_monthly(
+    lat: float = Query(...),
+    lon: float = Query(...),
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    baseline: str = Query("1981-2010"),
+    datasource: str = Query("era5"),
+):
+    return spi_gamma_series(lat=lat, lon=lon, start_date=start_date, end_date=end_date,
+                            window_days=30, baseline=baseline, datasource=datasource,
+                            step="month", yearly_method="total")
+
+@app.get("/demo/spi_gamma_series_yearly")
+def spi_gamma_series_yearly(
+    lat: float = Query(...),
+    lon: float = Query(...),
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    baseline: str = Query("1981-2010"),
+    datasource: str = Query("era5"),
+    yearly_method: Literal["total","window"] = Query("total"),
+    window_days: int = Query(30, ge=7, le=120),
+    anchor: str = Query("12-31"),
+):
+    # Parse anchor "MM-DD"
+    try:
+        mm, dd = anchor.split("-")
+        anchor_mm = int(mm); anchor_dd = int(dd)
+    except Exception:
+        anchor_mm, anchor_dd = 12, 31
+    return spi_gamma_series(lat=lat, lon=lon, start_date=start_date, end_date=end_date,
+                            window_days=window_days, baseline=baseline, datasource=datasource,
+                            step="year", yearly_method=yearly_method,
+                            anchor_mm=anchor_mm, anchor_dd=anchor_dd)
 
 # ============== Convenience: get BOTH monthly & yearly ==============
 @app.get("/demo/spi_gamma_both")
