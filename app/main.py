@@ -1,29 +1,3 @@
-""" 
-DMAP-AI API (demo-locked)
-Adds SPI monthly & yearly Gamma series and convenience endpoints.
-
-Endpoints
----------
-• GET /                               — info
-• GET /health                         — health
-• GET /indices/spi                    — z-score SPI from user-provided sum/mean/std
-• GET /demo/spi_historical_auto       — legacy z-score SPI using NASA POWER
-• GET /demo/spi_gamma_historical_auto — single Gamma SPI on trailing window
-• GET /demo/spi_gamma_series          — SPI series (step=month|year; yearly_method=total|window)
-• GET /demo/spi_gamma_series_monthly  — Convenience (calls series with step=month)
-• GET /demo/spi_gamma_series_yearly   — Convenience (calls series with step=year)
-• GET /demo/spi_gamma_both            — Returns {monthly, yearly}
-• GET /indices/spei, /forecast/next7  — disabled in demo
-
-Notes
------
-• For series items we now emit **window_sum_mm**, and also include aliases
-  **total_mm** and **obs_sum_mm** for frontend compatibility.
-• Yearly “total” means Jan–Dec annual precipitation totals (no window_days sent).
-• Yearly “window” uses a rolling N-day trailing window ending on an anchor date
-  in each year (N is capped at 120 for demo performance).
-"""
-
 import os
 import calendar
 import datetime as dt
@@ -48,7 +22,7 @@ app = FastAPI(title="DMAP-AI API", version="0.9.0")
 # ----------------------------- CORS ---------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later e.g. ["https://dmap.agrimetsoft.com"]
+    allow_origins=["*"], # tighten later e.g. ["https://dmap.agrimetsoft.com"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -113,7 +87,7 @@ def spi(
 
 # ------------------- Common helpers for auto SPI --------------------
 POWER_BASE = "https://power.larc.nasa.gov/api/temporal/daily/point"
-POWER_PARAM = "PRECTOTCORR"  # daily precipitation (mm/day)
+POWER_PARAM = "PRECTOTCORR" # daily precipitation (mm/day)
 
 def _yyyymmdd(d: dt.date) -> str:
     return d.strftime("%Y%m%d")
@@ -619,7 +593,9 @@ def spi_wavelet(req: WaveletRequest):
     global_power : list
         Mean wavelet power at each period.
     scalogram : 2D list
-        Power(time, period) matrix for plotting a time–frequency map.
+        Power(time, period) matrix for plotting a time–frequency map,
+        where the outer list index corresponds to time (X-axis) and the inner
+        list index corresponds to period (Y-axis), allowing direct use by the frontend.
     coherence : list or null
         If precipitation is provided, an approximate wavelet coherence
         (0–1) between SPI and precipitation per period.
@@ -639,7 +615,11 @@ def spi_wavelet(req: WaveletRequest):
     # Morlet CWT of SPI
     coeff_spi, freqs = pywt.cwt(spi_arr, scales, "morl")
     power = (coeff_spi * np.conj(coeff_spi)).real  # (n_scales, n_time)
-    global_power = power.mean(axis=1)
+
+    # REVISION: Transpose power from (n_scales, n_time) to (n_time, n_scales)
+    # This aligns the output structure with what the frontend expects for drawing: [time_index][period_index]
+    scalogram_data = power.T.tolist()
+    global_power = power.mean(axis=1).tolist()
 
     coherence = None
     if req.precip is not None:
@@ -665,9 +645,9 @@ def spi_wavelet(req: WaveletRequest):
     return {
         "ok": True,
         "n_points": int(spi_arr.size),
-        "periods": scales.tolist(),
-        "global_power": global_power.tolist(),
-        "scalogram": power.tolist(),
+        "periods": scales.tolist(), # <-- The Y-axis tick labels for the scalogram
+        "global_power": global_power,
+        "scalogram": scalogram_data, # <-- Transposed to [Time][Period]
         "coherence": coherence,
         "note": "Morlet CWT-based wavelet spectrum. Periods are in index steps of the input SPI series.",
     }
@@ -683,8 +663,8 @@ def spi_gamma_series_monthly(
     datasource: str = Query("era5"),
 ):
     return spi_gamma_series(lat=lat, lon=lon, start_date=start_date, end_date=end_date,
-                            window_days=30, baseline=baseline, datasource=datasource,
-                            step="month", yearly_method="total")
+                             window_days=30, baseline=baseline, datasource=datasource,
+                             step="month", yearly_method="total")
 
 @app.get("/demo/spi_gamma_series_yearly")
 def spi_gamma_series_yearly(
@@ -706,9 +686,9 @@ def spi_gamma_series_yearly(
     except Exception:
         anchor_mm, anchor_dd = 12, 31
     return spi_gamma_series(lat=lat, lon=lon, start_date=start_date, end_date=end_date,
-                            window_days=window_days, baseline=baseline, datasource=datasource,
-                            step="year", yearly_method=yearly_method,
-                            anchor_mm=anchor_mm, anchor_dd=anchor_dd)
+                             window_days=window_days, baseline=baseline, datasource=datasource,
+                             step="year", yearly_method=yearly_method,
+                             anchor_mm=anchor_mm, anchor_dd=anchor_dd)
 
 # ============== Convenience: get BOTH monthly & yearly ==============
 @app.get("/demo/spi_gamma_both")
@@ -725,7 +705,7 @@ def spi_gamma_both(
                                step="month", yearly_method="total")  # yearly_method ignored for month
     yearly  = spi_gamma_series(lat=lat, lon=lon, start_date=start_date, end_date=end_date,
                                window_days=30, baseline=baseline, datasource=datasource,
-                               step="year",  yearly_method="total")
+                               step="year", yearly_method="total")
     return {"monthly": monthly, "yearly": yearly}
 
 # ---------------------- Disabled (demo) routes ---------------------
