@@ -1,4 +1,4 @@
-"""
+""" 
 DMAP-AI API (demo-locked)
 Adds SPI monthly & yearly Gamma series and convenience endpoints.
 
@@ -35,10 +35,15 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, Literal
 
+# NEW: numerical + wavelet utils
+import numpy as np
+import pywt
+from pydantic import BaseModel
+
 # SciPy for Gamma CDF and Normal inverse CDF
 from scipy.stats import gamma as gamma_dist, norm
 
-app = FastAPI(title="DMAP-AI API", version="0.8.0")
+app = FastAPI(title="DMAP-AI API", version="0.9.0")
 
 # ----------------------------- CORS ---------------------------------
 app.add_middleware(
@@ -121,7 +126,7 @@ def _parse_baseline(baseline: str) -> Tuple[int, int]:
         return (1981, 2010)
 
 def _fetch_power_precip(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
-    # NOTE: For demo we use NASA POWER daily precip. UI may show 'ERA5' but demo fetches POWER.
+    """Fetch daily precip from NASA POWER for [start, end]."""
     params = {
         "parameters": POWER_PARAM,
         "community": "AG",
@@ -173,7 +178,8 @@ def _month_iter(start: dt.date, end: dt.date):
     while (y < end.year) or (y == end.year and m <= end.month):
         yield (y, m)
         if m == 12:
-            y += 1; m = 1
+            y += 1
+            m = 1
         else:
             m += 1
 
@@ -219,12 +225,18 @@ def _zscore(x: float, samples: List[float]) -> Optional[float]:
 def _spi_category(spi: Optional[float]) -> str:
     if spi is None:
         return "Undefined"
-    if spi <= -2.0: return "Extreme drought"
-    if spi <= -1.5: return "Severe drought"
-    if spi <= -1.0: return "Moderate drought"
-    if spi <  1.0:  return "Near normal"
-    if spi <  1.5:  return "Moderately wet"
-    if spi <  2.0:  return "Very wet"
+    if spi <= -2.0:
+        return "Extreme drought"
+    if spi <= -1.5:
+        return "Severe drought"
+    if spi <= -1.0:
+        return "Moderate drought"
+    if spi <  1.0:
+        return "Near normal"
+    if spi <  1.5:
+        return "Moderately wet"
+    if spi <  2.0:
+        return "Very wet"
     return "Extremely wet"
 
 def _add_sum_aliases(d: Dict, val: float):
@@ -232,6 +244,35 @@ def _add_sum_aliases(d: Dict, val: float):
     d["window_sum_mm"] = round(val, 3)
     d["obs_sum_mm"] = round(val, 3)
     d["total_mm"] = round(val, 3)
+
+# ----------------- Wavelet helpers & request model ------------------
+
+def _interp_nan_to_mean(arr: np.ndarray) -> np.ndarray:
+    """Fill NaNs/inf in a 1D array by linear interpolation.
+
+    If fewer than 2 finite values exist, returns zeros.
+    """
+    a = arr.astype(float)
+    n = a.size
+    idx = np.arange(n)
+    mask = np.isfinite(a)
+    if mask.sum() < 2:
+        return np.zeros_like(a)
+    a[~mask] = np.interp(idx[~mask], idx[mask], a[mask])
+    return a
+
+class WaveletRequest(BaseModel):
+    """Request body for SPI wavelet analysis.
+
+    Period units are in index steps of the series (months for monthly SPI,
+    years for yearly SPI).
+    """
+    spi: List[float]
+    precip: Optional[List[float]] = None
+    dt: float = 1.0
+    min_period: int = 1
+    max_period: int = 24
+    n_scales: int = 10
 
 # ------------------- SPI (auto, z-score / legacy) -------------------
 @app.get("/demo/spi_historical_auto")
@@ -382,7 +423,7 @@ def spi_gamma_historical_auto(
         "note": "SPI via 2-parameter Gamma fit on baseline window sums (zeros handled).",
     }
 
-# ============== SPI SERIES (MONTHLY or YEARLY) ======================
+# ================= SPI SERIES (MONTHLY or YEARLY) ===================
 @app.get("/demo/spi_gamma_series")
 def spi_gamma_series(
     lat: float = Query(...),
@@ -566,6 +607,70 @@ def spi_gamma_series(
         "note": "SPI per year using rolling N-day window ending on anchor date.",
     }
 
+# --------------- NEW: SPI wavelet analysis endpoint -----------------
+@app.post("/analysis/spi_wavelet")
+def spi_wavelet(req: WaveletRequest):
+    """Continuous wavelet transform (Morlet) of SPI time series.
+
+    Returns
+    -------
+    periods : list
+        Periods in *index steps* (months for monthly SPI, years for yearly SPI).
+    global_power : list
+        Mean wavelet power at each period.
+    scalogram : 2D list
+        Power(time, period) matrix for plotting a time–frequency map.
+    coherence : list or null
+        If precipitation is provided, an approximate wavelet coherence
+        (0–1) between SPI and precipitation per period.
+    """
+    if not req.spi or len(req.spi) < 8:
+        raise HTTPException(status_code=400, detail={"message": "Need at least 8 SPI values for wavelet analysis."})
+
+    spi_arr = np.asarray(req.spi, dtype=float)
+    spi_arr = _interp_nan_to_mean(spi_arr)
+
+    # define scales / periods
+    n_scales = max(1, int(req.n_scales))
+    min_p = max(1, int(req.min_period))
+    max_p = max(min_p, int(req.max_period))
+    scales = np.linspace(min_p, max_p, n_scales)
+
+    # Morlet CWT of SPI
+    coeff_spi, freqs = pywt.cwt(spi_arr, scales, "morl")
+    power = (coeff_spi * np.conj(coeff_spi)).real  # (n_scales, n_time)
+    global_power = power.mean(axis=1)
+
+    coherence = None
+    if req.precip is not None:
+        if len(req.precip) != len(req.spi):
+            raise HTTPException(status_code=400, detail={"message": "If provided, 'precip' must have same length as 'spi'."})
+        prec_arr = np.asarray(req.precip, dtype=float)
+        prec_arr = _interp_nan_to_mean(prec_arr)
+        coeff_prec, _ = pywt.cwt(prec_arr, scales, "morl")
+
+        # Simple Torrence–Compo-style coherence approximation with global smoothing
+        Wxy = coeff_spi * np.conj(coeff_prec)
+        Sxx = (coeff_spi * np.conj(coeff_spi)).real
+        Syy = (coeff_prec * np.conj(coeff_prec)).real
+
+        num = np.abs(Wxy.mean(axis=1)) ** 2
+        den = Sxx.mean(axis=1) * Syy.mean(axis=1)
+        coh = np.zeros_like(num)
+        valid = den > 0
+        coh[valid] = (num[valid] / den[valid]).real
+        coh = np.clip(coh, 0.0, 1.0)
+        coherence = coh.tolist()
+
+    return {
+        "ok": True,
+        "n_points": int(spi_arr.size),
+        "periods": scales.tolist(),
+        "global_power": global_power.tolist(),
+        "scalogram": power.tolist(),
+        "coherence": coherence,
+        "note": "Morlet CWT-based wavelet spectrum. Periods are in index steps of the input SPI series.",
+    }
 
 # ============== Convenience endpoints (avoid 404s) ==================
 @app.get("/demo/spi_gamma_series_monthly")
@@ -596,7 +701,8 @@ def spi_gamma_series_yearly(
     # Parse anchor "MM-DD"
     try:
         mm, dd = anchor.split("-")
-        anchor_mm = int(mm); anchor_dd = int(dd)
+        anchor_mm = int(mm)
+        anchor_dd = int(dd)
     except Exception:
         anchor_mm, anchor_dd = 12, 31
     return spi_gamma_series(lat=lat, lon=lon, start_date=start_date, end_date=end_date,
