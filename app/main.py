@@ -17,26 +17,35 @@ from fastapi.middleware.cors import CORSMiddleware
 import xarray as xr
 import pandas as pd
 
-app = FastAPI(title="DMAP-AI API", version="0.9.3")
+# ==========================================================
+#  FASTAPI APP SETUP (Render)
+# ==========================================================
+app = FastAPI(title="DMAP-AI API (Render)", version="1.0.0")
 
-# ----------------------------- CORS ---------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # Adjust if you want stricter origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --------------------------- DEMO LOCK ------------------------------
-DEMO_LOCK = os.getenv("DEMO_LOCK", "1") == "1"
-ALLOWED_MODE = os.getenv("DEMO_MODE", "historical").lower()
-ALLOWED_AOI = os.getenv("DEMO_AOI", "point").lower()
-ALLOWED_DATASOURCE = os.getenv("DEMO_DATASOURCE", "era5").lower()
+# ----------------------------------------------------------
+# DEMO LOCK (Render: controlled by env var)
+# ----------------------------------------------------------
+# Set DEMO_LOCK=1 in Render environment if you want to limit usage;
+# otherwise leave unset or 0 for full functionality.
+DEMO_LOCK = os.getenv("DEMO_LOCK", "0") == "1"
+ALLOWED_MODE = "historical"
+ALLOWED_AOI = "point"
+ALLOWED_DATASOURCE = "era5"
 
 
 def _enforce_demo(mode: Optional[str], aoi: Optional[str], datasource: Optional[str]):
-    """Optional demo guard. If DEMO_LOCK=0, this does nothing."""
+    """
+    Optional demo guard. If DEMO_LOCK=0, this does nothing.
+    If DEMO_LOCK=1, restricts mode/aoi/datasource.
+    """
     if not DEMO_LOCK:
         return
     if mode is not None and mode.lower() != ALLOWED_MODE:
@@ -77,12 +86,14 @@ def _enforce_demo(mode: Optional[str], aoi: Optional[str], datasource: Optional[
         )
 
 
-# --------------------------- Root/Health ----------------------------
+# ==========================================================
+#  BASIC INFO ENDPOINTS
+# ==========================================================
 @app.get("/")
 def root():
     return {
         "ok": True,
-        "message": "DMAP-AI API. See /health and /docs",
+        "message": "DMAP-AI API (Render). See /health and /docs",
         "demo_lock": DEMO_LOCK,
     }
 
@@ -92,7 +103,9 @@ def health():
     return {"ok": True, "demo_lock": DEMO_LOCK}
 
 
-# -------------------------- SPI (simple) ----------------------------
+# ==========================================================
+#  SIMPLE SPI ENDPOINT (Z-SCORE)
+# ==========================================================
 @app.get("/indices/spi")
 def spi(
     sum_rain_mm: float = Query(...),
@@ -115,7 +128,9 @@ def spi(
     }
 
 
-# ------------------- Common helpers / POWER backend -----------------
+# ==========================================================
+#  NASA POWER BACKEND (ERA5 PLACEHOLDER)
+# ==========================================================
 POWER_BASE = "https://power.larc.nasa.gov/api/temporal/daily/point"
 POWER_PARAM = "PRECTOTCORR"  # mm/day
 
@@ -133,7 +148,9 @@ def _parse_baseline(baseline: str) -> Tuple[int, int]:
 
 
 def _fetch_power_precip(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
-    """NASA POWER daily precipitation as a fallback/placeholder backend."""
+    """
+    NASA POWER daily precipitation as a placeholder backend for 'era5'.
+    """
     params = {
         "parameters": POWER_PARAM,
         "community": "AG",
@@ -143,7 +160,14 @@ def _fetch_power_precip(lat: float, lon: float, start: dt.date, end: dt.date) ->
         "end": _yyyymmdd(end),
         "format": "JSON",
     }
-    r = requests.get(POWER_BASE, params=params, timeout=45)
+    try:
+        r = requests.get(POWER_BASE, params=params, timeout=30)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail={"message": f"NASA POWER request failed: {type(e).__name__} - {str(e)}"},
+        )
+
     if r.status_code != 200:
         raise HTTPException(
             status_code=502,
@@ -164,7 +188,9 @@ def _fetch_power_precip(lat: float, lon: float, start: dt.date, end: dt.date) ->
     return {k: float(v) for k, v in param.items()}
 
 
-# ---------------------- Datasource routing --------------------------
+# ==========================================================
+#  DATASOURCE ROUTING (ERA5, GRIDMET, PRISM, GPM)
+# ==========================================================
 SUPPORTED_GRID_DATASOURCES = {"era5", "gridmet", "prism", "gpm"}
 USER_DATASOURCE = "user"
 
@@ -177,26 +203,21 @@ def _resolve_datasource(datasource: Optional[str]) -> str:
         raise HTTPException(
             status_code=400,
             detail={
-                "message": "User-upload ('user') datasource is not implemented on the server yet. "
-                "The backend only supports gridded sources here. Use a separate upload endpoint "
-                "for station CSVs.",
+                "message": "User-upload ('user') datasource is not implemented in this backend. "
+                           "This API currently supports only gridded sources: era5, gridmet, prism, gpm."
             },
         )
     raise HTTPException(
         status_code=400,
         detail={
             "message": f"Unknown datasource '{datasource}'. "
-            "Supported: era5, gridmet, prism, gpm, user."
+                       "Supported: era5, gridmet, prism, gpm, user."
         },
     )
 
 
 def _fetch_precip_era5(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
-    """ERA5 placeholder (currently using NASA POWER daily precip).
-
-    To use true ERA5, replace this with code reading your own ERA5
-    daily precipitation (e.g., from NetCDF on disk or a local THREDDS).
-    """
+    """ERA5 placeholder (currently NASA POWER daily precip)."""
     return _fetch_power_precip(lat, lon, start, end)
 
 
@@ -210,23 +231,23 @@ def _fetch_precip_gridmet(
     Returns a dict: {"YYYY-MM-DD": value_mm, ...}
     """
 
-    # NCSS subset endpoint (NOT dodsC / OPeNDAP)
     NCSS_URL = (
-        "https://thredds.northwestknowledge.net:443/"
+        "https://thredds.northwestknowledge.net/"
         "thredds/ncss/agg_met_pr_1979_CurrentYear_daily.nc"
     )
 
-    # Basic CONUS bounds check (GridMET coverage)
+    # GridMET coverage ~ CONUS
     if not (25 < lat < 50 and -125 < lon < -67):
         raise HTTPException(
             status_code=400,
             detail={
                 "message": "GridMET data is only available for CONUS "
-                           "(approx 25–50N, 125–67W)."
+                           "(approx 25–50N, 125–67W).",
+                "lat": lat,
+                "lon": lon,
             },
         )
 
-    # NCSS expects ISO timestamps
     start_iso = start.isoformat() + "T00:00:00Z"
     end_iso   = end.isoformat() + "T23:59:59Z"
 
@@ -241,55 +262,70 @@ def _fetch_precip_gridmet(
     }
 
     try:
-        # Get a small NetCDF subset over HTTP
-        r = requests.get(NCSS_URL, params=params, timeout=60)
-        if r.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "Failed to fetch GridMET NCSS subset",
-                    "status": r.status_code,
-                    "text": r.text[:300],
-                },
-            )
+        r = requests.get(NCSS_URL, params=params, timeout=45)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": f"Failed to contact GridMET NCSS endpoint: {type(e).__name__} - {str(e)}",
+            },
+        )
 
-        # Open the in-memory NetCDF
-        with xr.open_dataset(io.BytesIO(r.content)) as ds:
-            # Expect 'time' dimension and 'pr' variable
+    if r.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Failed to fetch GridMET NCSS subset",
+                "status": r.status_code,
+                "text": r.text[:300],
+            },
+        )
+
+    try:
+        # IMPORTANT: for in-memory bytes, use engine="scipy"
+        with xr.open_dataset(io.BytesIO(r.content), engine="scipy") as ds:
+            if "pr" not in ds:
+                raise HTTPException(
+                    status_code=502,
+                    detail={"message": "Variable 'pr' not found in GridMET NCSS subset."},
+                )
             da = ds["pr"].load()
-
-        series = da.to_series()
-
-        results: Dict[str, float] = {}
-        for timestamp, value in series.items():
-            date_key = timestamp.strftime("%Y-%m-%d")
-            results[date_key] = float(value) if not pd.isna(value) else 0.0
-
-        return results
-
-    except HTTPException:
-        # Pass through FastAPI HTTP errors
-        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail={
-                "message": f"Failed to fetch GridMET data (NCSS): {type(e).__name__} - {str(e)}",
-                "info": "Check that lat/lon is in CONUS and that the THREDDS NCSS endpoint is reachable.",
+                "message": f"Failed to open GridMET NetCDF subset: {type(e).__name__} - {str(e)}",
             },
         )
 
+    series = da.to_series()
+
+    results: Dict[str, float] = {}
+    for timestamp, value in series.items():
+        date_key = timestamp.strftime("%Y-%m-%d")
+        results[date_key] = float(value) if not pd.isna(value) else 0.0
+
+    return results
+
+
+def _fetch_precip_prism(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
+    """PRISM placeholder. Implement your PRISM reader here."""
+    raise HTTPException(
+        status_code=501,
+        detail={
+            "message": "PRISM datasource is not wired yet. "
+                       "Implement _fetch_precip_prism() to read your PRISM data.",
+        },
+    )
+
 
 def _fetch_precip_gpm(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
-    """GPM placeholder.
-
-    Implement this to read GPM IMERG precip from your own storage.
-    """
+    """GPM placeholder. Implement your GPM reader here."""
     raise HTTPException(
         status_code=501,
         detail={
             "message": "GPM datasource is not wired yet. "
-            "Implement _fetch_precip_gpm() to read your GPM data.",
+                       "Implement _fetch_precip_gpm() to read your GPM data.",
         },
     )
 
@@ -313,7 +349,9 @@ def _fetch_precip_by_source(
     raise HTTPException(status_code=500, detail={"message": "Unhandled datasource routing."})
 
 
-# ---------------- SPI helpers (gamma / zscore) ----------------------
+# ==========================================================
+#  SPI / GAMMA HELPERS
+# ==========================================================
 def _sum_window(s: dt.date, e: dt.date, dct: Dict[str, float]) -> float:
     total = 0.0
     cur = s
@@ -329,9 +367,7 @@ def _aligned_baseline_window_sums(
     sums: List[float] = []
     for yr in range(by0, by1 + 1):
         try:
-            last_day = (dt.date(yr, end.month, 1) + dt.timedelta(days=31)).replace(day=1) - dt.timedelta(
-                days=1
-            )
+            last_day = (dt.date(yr, end.month, 1) + dt.timedelta(days=31)).replace(day=1) - dt.timedelta(days=1)
             end_y = dt.date(yr, end.month, min(end.day, last_day.day))
         except Exception:
             end_y = dt.date(yr, end.month, 28) if end.month == 2 else dt.date(yr, end.month, 1)
@@ -414,7 +450,9 @@ def _spi_category(spi: Optional[float]) -> str:
     return "Extremely wet"
 
 
-# ----------------- Wavelet helpers & request model ------------------
+# ==========================================================
+#  WAVELET HELPERS
+# ==========================================================
 def _interp_nan_to_mean(arr: np.ndarray) -> np.ndarray:
     a = arr.astype(float)
     n = a.size
@@ -435,7 +473,9 @@ class WaveletRequest(BaseModel):
     n_scales: int = 10
 
 
-# ------------------- SPI (auto, z-score / legacy) -------------------
+# ==========================================================
+#  SPI HISTORICAL Z-SCORE
+# ==========================================================
 @app.get("/demo/spi_historical_auto")
 def spi_historical_auto(
     lat: float = Query(...),
@@ -444,9 +484,10 @@ def spi_historical_auto(
     window_days: int = Query(30, ge=7, le=120),
     baseline: str = Query("1981-2010"),
     datasource: str = Query("era5"),
+    mode: Optional[str] = Query(None),
+    aoi: Optional[str] = Query(None),
 ):
-    if DEMO_LOCK and datasource.lower() != ALLOWED_DATASOURCE:
-        raise HTTPException(status_code=403, detail={"message": "Demo mode: only one datasource is enabled."})
+    _enforce_demo(mode, aoi, datasource)
 
     try:
         end = dt.date.fromisoformat(end_date)
@@ -490,7 +531,9 @@ def spi_historical_auto(
     }
 
 
-# --------- SPI (auto, Gamma fit with zero-precip adjustment) --------
+# ==========================================================
+#  SPI HISTORICAL (GAMMA)
+# ==========================================================
 @app.get("/demo/spi_gamma_historical_auto")
 def spi_gamma_historical_auto(
     lat: float = Query(...),
@@ -499,9 +542,10 @@ def spi_gamma_historical_auto(
     window_days: int = Query(30, ge=7, le=120),
     baseline: str = Query("1981-2010"),
     datasource: str = Query("era5"),
+    mode: Optional[str] = Query(None),
+    aoi: Optional[str] = Query(None),
 ):
-    if DEMO_LOCK and datasource.lower() != ALLOWED_DATASOURCE:
-        raise HTTPException(status_code=403, detail={"message": "Demo mode: only one datasource is enabled."})
+    _enforce_demo(mode, aoi, datasource)
 
     try:
         end = dt.date.fromisoformat(end_date)
@@ -575,7 +619,9 @@ def spi_gamma_historical_auto(
     }
 
 
-# ================= SPI SERIES (MONTHLY or YEARLY) ===================
+# ==========================================================
+#  SPI SERIES (MONTHLY / YEARLY)
+# ==========================================================
 @app.get("/demo/spi_gamma_series")
 def spi_gamma_series(
     lat: float = Query(...),
@@ -590,9 +636,10 @@ def spi_gamma_series(
     anchor_mm: int = Query(12, ge=1, le=12),
     anchor_dd: int = Query(31, ge=1, le=31),
     anchor: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None),
+    aoi: Optional[str] = Query(None),
 ):
-    if DEMO_LOCK and datasource.lower() != ALLOWED_DATASOURCE:
-        raise HTTPException(status_code=403, detail={"message": "Demo mode: only one datasource is enabled."})
+    _enforce_demo(mode, aoi, datasource)
 
     try:
         start = dt.date.fromisoformat(start_date)
@@ -774,7 +821,9 @@ def spi_gamma_series(
     }
 
 
-# --------------- Wavelet analysis endpoint --------------------------
+# ==========================================================
+#  WAVELET ENDPOINT
+# ==========================================================
 @app.post("/analysis/spi_wavelet")
 def spi_wavelet(req: WaveletRequest):
     if not req.spi or len(req.spi) < 8:
@@ -827,7 +876,9 @@ def spi_wavelet(req: WaveletRequest):
     }
 
 
-# ------------- Convenience endpoints (avoid 404s) -------------------
+# ==========================================================
+#  CONVENIENCE ENDPOINTS (MONTHLY/YEARLY WRAPPERS)
+# ==========================================================
 @app.get("/demo/spi_gamma_series_monthly")
 def spi_gamma_series_monthly(
     lat: float = Query(...),
@@ -836,6 +887,8 @@ def spi_gamma_series_monthly(
     end_date: str = Query(...),
     baseline: str = Query("1981-2010"),
     datasource: str = Query("era5"),
+    mode: Optional[str] = Query(None),
+    aoi: Optional[str] = Query(None),
 ):
     return spi_gamma_series(
         lat=lat,
@@ -847,6 +900,8 @@ def spi_gamma_series_monthly(
         datasource=datasource,
         step="month",
         yearly_method="total",
+        mode=mode,
+        aoi=aoi,
     )
 
 
@@ -861,6 +916,8 @@ def spi_gamma_series_yearly(
     yearly_method: Literal["total", "window"] = Query("total"),
     window_days: int = Query(30, ge=7, le=120),
     anchor: str = Query("12-31"),
+    mode: Optional[str] = Query(None),
+    aoi: Optional[str] = Query(None),
 ):
     try:
         mm, dd = anchor.split("-")
@@ -881,31 +938,6 @@ def spi_gamma_series_yearly(
         yearly_method=yearly_method,
         anchor_mm=anchor_mm,
         anchor_dd=anchor_dd,
+        mode=mode,
+        aoi=aoi,
     )
-
-
-# ---------------------- Disabled placeholders -----------------------
-@app.get("/indices/spei")
-def spei_disabled():
-    if DEMO_LOCK:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "message": "Demo mode: SPEI endpoint is disabled.",
-                "enable_hint": "Set DEMO_LOCK=0 when SPEI is implemented.",
-            },
-        )
-    raise HTTPException(status_code=501, detail="SPEI not implemented yet.")
-
-
-@app.get("/forecast/next7")
-def fcst_next7_disabled():
-    if DEMO_LOCK:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "message": "Demo mode: forecast endpoints are disabled.",
-                "enable_hint": "Set DEMO_LOCK=0 when forecasts are implemented.",
-            },
-        )
-    raise HTTPException(status_code=501, detail="Forecasts not implemented yet.")
