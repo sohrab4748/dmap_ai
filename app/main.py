@@ -13,9 +13,8 @@ from scipy.stats import gamma as gamma_dist, norm
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from netCDF4 import Dataset, num2date  # add near top of file with other imports
 
-import xarray as xr
-import pandas as pd
 
 # ==========================================================
 #  FASTAPI APP SETUP (Render)
@@ -228,7 +227,8 @@ def _fetch_precip_gridmet(
     Fetch daily precipitation (mm/day) from GridMET via THREDDS NCSS
     for a single point and a given date range [start, end].
 
-    Returns a dict: {"YYYY-MM-DD": value_mm, ...}
+    Uses netCDF4 directly (no xarray, no pandas).
+    Returns: {"YYYY-MM-DD": value_mm, ...}
     """
 
     NCSS_URL = (
@@ -281,43 +281,85 @@ def _fetch_precip_gridmet(
             },
         )
 
+    # ---- Open NetCDF from bytes using netCDF4.Dataset ----
     try:
-        # IMPORTANT: for in-memory bytes, use engine="scipy"
-        with xr.open_dataset(io.BytesIO(r.content), engine="scipy") as ds:
-            if "pr" not in ds:
-                raise HTTPException(
-                    status_code=502,
-                    detail={"message": "Variable 'pr' not found in GridMET NCSS subset."},
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".nc") as tmp:
+            tmp.write(r.content)
+            tmp.flush()
+
+            with Dataset(tmp.name, mode="r") as ds:
+                # Expect GridMET dimensions: time, lat, lon
+                if "pr" not in ds.variables:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={"message": "Variable 'pr' not found in GridMET NCSS subset."},
+                    )
+
+                # Read coordinate arrays
+                if "lat" not in ds.variables or "lon" not in ds.variables:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={"message": "GridMET subset missing 'lat' or 'lon' variables."},
+                    )
+
+                lat_arr = ds.variables["lat"][:]  # 1D
+                lon_arr = ds.variables["lon"][:]  # 1D
+
+                # Find nearest grid cell
+                lat_idx = int(np.abs(lat_arr - lat).argmin())
+                lon_idx = int(np.abs(lon_arr - lon).argmin())
+
+                pr_var = ds.variables["pr"]  # (time, lat, lon) or similar
+                pr_sel = pr_var[:, lat_idx, lon_idx]  # -> 1D array over time
+
+                # Time coordinate: some GridMET files use 'day', others 'time'
+                if "day" in ds.variables:
+                    tvar = ds.variables["day"]
+                elif "time" in ds.variables:
+                    tvar = ds.variables["time"]
+                else:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={"message": "No suitable time coordinate ('day' or 'time') in GridMET subset."},
+                    )
+
+                times = num2date(
+                    tvar[:],
+                    units=tvar.units,
+                    calendar=getattr(tvar, "calendar", "standard"),
                 )
-            da = ds["pr"].load()
+
+                # Build daily mapping
+                results: Dict[str, float] = {}
+                for dt_obj, val in zip(times, pr_sel):
+                    # Ensure it's within requested [start, end] in case NCSS returned a bit more
+                    d = dt_obj.date()
+                    if d < start or d > end:
+                        continue
+                    date_key = d.strftime("%Y-%m-%d")
+                    # pr is mm/day; just cast to float
+                    try:
+                        fv = float(val)
+                    except Exception:
+                        fv = 0.0
+                    # no pandas.isna — just handle NaNs via numpy
+                    if np.isnan(fv):
+                        fv = 0.0
+                    results[date_key] = fv
+
+        return results
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail={
-                "message": f"Failed to open GridMET NetCDF subset: {type(e).__name__} - {str(e)}",
+                "message": f"Failed to parse GridMET data (netCDF4): {type(e).__name__} - {str(e)}",
             },
         )
-
-    series = da.to_series()
-
-    results: Dict[str, float] = {}
-    for timestamp, value in series.items():
-        date_key = timestamp.strftime("%Y-%m-%d")
-        results[date_key] = float(value) if not pd.isna(value) else 0.0
-
-    return results
-
-
-def _fetch_precip_prism(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
-    """PRISM placeholder. Implement your PRISM reader here."""
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "message": "PRISM datasource is not wired yet. "
-                       "Implement _fetch_precip_prism() to read your PRISM data.",
-        },
-    )
-
 
 def _fetch_precip_gpm(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
     """GPM placeholder. Implement your GPM reader here."""
