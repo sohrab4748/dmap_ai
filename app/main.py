@@ -229,8 +229,8 @@ def _fetch_precip_gridmet(
     Fetch daily precipitation (mm/day) from GridMET via THREDDS NCSS
     for a single point and a given date range [start, end].
 
-    Uses xarray + engine="scipy" (no netCDF4, no pandas).
-    Returns: {"YYYY-MM-DD": value_mm, ...}
+    Uses xarray + engine="h5netcdf" (NetCDF4/HDF5) so we do NOT need the
+    system-level netCDF4 C library. Returns: {"YYYY-MM-DD": value_mm, ...}
     """
 
     NCSS_URL = (
@@ -260,7 +260,7 @@ def _fetch_precip_gridmet(
         "temporal": "true",
         "time_start": start_iso,
         "time_end": end_iso,
-        "accept": "netcdf",
+        "accept": "netcdf",   # NCSS will return a NetCDF4 file; h5netcdf can read it
     }
 
     try:
@@ -283,16 +283,16 @@ def _fetch_precip_gridmet(
             },
         )
 
-    # ---- Open NetCDF from bytes using xarray + scipy engine ----
     try:
-        with xr.open_dataset(io.BytesIO(r.content), engine="scipy") as ds:
+        # IMPORTANT: use engine="h5netcdf" for NetCDF4/HDF5 files
+        with xr.open_dataset(io.BytesIO(r.content), engine="h5netcdf") as ds:
             if "pr" not in ds:
                 raise HTTPException(
                     status_code=502,
                     detail={"message": "Variable 'pr' not found in GridMET NCSS subset."},
                 )
 
-            # Select nearest grid cell to requested lat/lon
+            # Select nearest grid cell & requested time slice
             da = ds["pr"].sel(
                 lat=lat,
                 lon=lon,
@@ -306,7 +306,7 @@ def _fetch_precip_gridmet(
 
         results: Dict[str, float] = {}
         for t, v in zip(times, vals):
-            # Convert datetime64 -> 'YYYY-MM-DD'
+            # datetime64 -> 'YYYY-MM-DD'
             day_str = np.datetime_as_string(t, unit="D")
             try:
                 fv = float(v)
@@ -324,7 +324,8 @@ def _fetch_precip_gridmet(
         raise HTTPException(
             status_code=500,
             detail={
-                "message": f"Failed to parse GridMET data (xarray/scipy): {type(e).__name__} - {str(e)}",
+                "message": f"Failed to parse GridMET data (xarray/h5netcdf): "
+                           f"{type(e).__name__} - {str(e)}",
             },
         )
 
