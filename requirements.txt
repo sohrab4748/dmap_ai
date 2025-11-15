@@ -1,10 +1,10 @@
-fastapi
-uvicorn[standard]
-requests
-numpy
-pywavelets
 pydantic
-scipy
 xarray
-netCDF4
 pandas
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+requests==2.32.3
+numpy==2.1.2
+pywavelets==1.7.0
+scipy==1.14.1
+netCDF4==1.7.1.post2
