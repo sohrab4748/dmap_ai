@@ -1,9 +1,10 @@
 fastapi
 uvicorn[standard]
 requests
-scipy
+numpy
 pywavelets
-numpy 
+pydantic
+scipy
 xarray
 netCDF4
 pandas
