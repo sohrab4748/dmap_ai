@@ -1,4 +1,5 @@
 import os
+import io
 import calendar
 import datetime as dt
 from statistics import mean, stdev
@@ -203,75 +204,80 @@ def _fetch_precip_gridmet(
     lat: float, lon: float, start: dt.date, end: dt.date
 ) -> Dict[str, float]:
     """
-    Fetch daily precipitation (mm/day) from GridMET via THREDDS/OPeNDAP
+    Fetch daily precipitation (mm/day) from GridMET via THREDDS NCSS
     for a single point and a given date range [start, end].
 
     Returns a dict: {"YYYY-MM-DD": value_mm, ...}
     """
-    GRIDMET_URL = (
-        "http://thredds.northwestknowledge.net:8080/"
-        "thredds/dodsC/agg_met_pr_1979_CurrentYear_daily.nc"
+
+    # NCSS subset endpoint (NOT dodsC / OPeNDAP)
+    NCSS_URL = (
+        "https://thredds.northwestknowledge.net:443/"
+        "thredds/ncss/agg_met_pr_1979_CurrentYear_daily.nc"
     )
 
-    start_str = start.strftime("%Y-%m-%d")
-    end_str = end.strftime("%Y-%m-%d")
+    # Basic CONUS bounds check (GridMET coverage)
+    if not (25 < lat < 50 and -125 < lon < -67):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "GridMET data is only available for CONUS "
+                           "(approx 25–50N, 125–67W)."
+            },
+        )
+
+    # NCSS expects ISO timestamps
+    start_iso = start.isoformat() + "T00:00:00Z"
+    end_iso   = end.isoformat() + "T23:59:59Z"
+
+    params = {
+        "var": "pr",
+        "latitude": str(lat),
+        "longitude": str(lon),
+        "temporal": "true",
+        "time_start": start_iso,
+        "time_end": end_iso,
+        "accept": "netcdf",
+    }
 
     try:
-        # CONUS approximate bounds used by GridMET
-        if not (25 < lat < 50 and -125 < lon < -67):
+        # Get a small NetCDF subset over HTTP
+        r = requests.get(NCSS_URL, params=params, timeout=60)
+        if r.status_code != 200:
             raise HTTPException(
-                status_code=400,
+                status_code=502,
                 detail={
-                    "message": "GridMET data is only available for CONUS "
-                               "(approx 25–50N, 125–67W)."
+                    "message": "Failed to fetch GridMET NCSS subset",
+                    "status": r.status_code,
+                    "text": r.text[:300],
                 },
             )
 
-        # Open remote dataset with xarray
-        with xr.open_dataset(GRIDMET_URL, engine="netcdf4") as ds:
-            # 'pr' is daily precip [mm/day]
-            data_slice = ds["pr"].sel(
-                lat=lat,
-                lon=lon,
-                time=slice(start_str, end_str),
-                method="nearest",
-            ).load()
+        # Open the in-memory NetCDF
+        with xr.open_dataset(io.BytesIO(r.content)) as ds:
+            # Expect 'time' dimension and 'pr' variable
+            da = ds["pr"].load()
 
-        precip_series = data_slice.to_series()
+        series = da.to_series()
 
         results: Dict[str, float] = {}
-        for timestamp, value in precip_series.items():
+        for timestamp, value in series.items():
             date_key = timestamp.strftime("%Y-%m-%d")
             results[date_key] = float(value) if not pd.isna(value) else 0.0
 
         return results
 
     except HTTPException:
-        # Re-throw FastAPI HTTPExceptions
+        # Pass through FastAPI HTTP errors
         raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail={
-                "message": f"Failed to fetch GridMET data: {type(e).__name__} - {str(e)}",
-                "info": "Check that lat/lon is in CONUS and that the THREDDS server is reachable.",
+                "message": f"Failed to fetch GridMET data (NCSS): {type(e).__name__} - {str(e)}",
+                "info": "Check that lat/lon is in CONUS and that the THREDDS NCSS endpoint is reachable.",
             },
         )
-
-
-def _fetch_precip_prism(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
-    """PRISM placeholder.
-
-    Implement this to read PRISM daily precipitation from your own
-    local NetCDF/THREDDS/Zarr store.
-    """
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "message": "PRISM datasource is not wired yet. "
-            "Implement _fetch_precip_prism() to read your PRISM data.",
-        },
-    )
 
 
 def _fetch_precip_gpm(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
