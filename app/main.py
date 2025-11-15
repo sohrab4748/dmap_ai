@@ -5,15 +5,18 @@ from statistics import mean, stdev
 from typing import Optional, Tuple, Dict, List, Literal
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-
 import numpy as np
 import pywt
 from pydantic import BaseModel
 from scipy.stats import gamma as gamma_dist, norm
 
-app = FastAPI(title="DMAP-AI API", version="0.9.2")
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+
+import xarray as xr
+import pandas as pd
+
+app = FastAPI(title="DMAP-AI API", version="0.9.3")
 
 # ----------------------------- CORS ---------------------------------
 app.add_middleware(
@@ -32,6 +35,7 @@ ALLOWED_DATASOURCE = os.getenv("DEMO_DATASOURCE", "era5").lower()
 
 
 def _enforce_demo(mode: Optional[str], aoi: Optional[str], datasource: Optional[str]):
+    """Optional demo guard. If DEMO_LOCK=0, this does nothing."""
     if not DEMO_LOCK:
         return
     if mode is not None and mode.lower() != ALLOWED_MODE:
@@ -128,6 +132,7 @@ def _parse_baseline(baseline: str) -> Tuple[int, int]:
 
 
 def _fetch_power_precip(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
+    """NASA POWER daily precipitation as a fallback/placeholder backend."""
     params = {
         "parameters": POWER_PARAM,
         "community": "AG",
@@ -172,8 +177,8 @@ def _resolve_datasource(datasource: Optional[str]) -> str:
             status_code=400,
             detail={
                 "message": "User-upload ('user') datasource is not implemented on the server yet. "
-                "The current backend only supports gridded sources. You must upload / preprocess "
-                "station CSVs separately and feed them via a dedicated endpoint."
+                "The backend only supports gridded sources here. Use a separate upload endpoint "
+                "for station CSVs.",
             },
         )
     raise HTTPException(
@@ -186,20 +191,79 @@ def _resolve_datasource(datasource: Optional[str]) -> str:
 
 
 def _fetch_precip_era5(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
-    """Placeholder ERA5 implementation.
+    """ERA5 placeholder (currently using NASA POWER daily precip).
 
-    Right now this just calls NASA POWER so that the API keeps working.
-    To use real ERA5, replace this with something that reads your own
-    preprocessed ERA5 daily precip (e.g., from NetCDF on disk).
+    To use true ERA5, replace this with code reading your own ERA5
+    daily precipitation (e.g., from NetCDF on disk or a local THREDDS).
     """
     return _fetch_power_precip(lat, lon, start, end)
+
+
+def _fetch_precip_gridmet(
+    lat: float, lon: float, start: dt.date, end: dt.date
+) -> Dict[str, float]:
+    """
+    Fetch daily precipitation (mm/day) from GridMET via THREDDS/OPeNDAP
+    for a single point and a given date range [start, end].
+
+    Returns a dict: {"YYYY-MM-DD": value_mm, ...}
+    """
+    GRIDMET_URL = (
+        "http://thredds.northwestknowledge.net:8080/"
+        "thredds/dodsC/agg_met_pr_1979_CurrentYear_daily.nc"
+    )
+
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+
+    try:
+        # CONUS approximate bounds used by GridMET
+        if not (25 < lat < 50 and -125 < lon < -67):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "GridMET data is only available for CONUS "
+                               "(approx 25–50N, 125–67W)."
+                },
+            )
+
+        # Open remote dataset with xarray
+        with xr.open_dataset(GRIDMET_URL, engine="netcdf4") as ds:
+            # 'pr' is daily precip [mm/day]
+            data_slice = ds["pr"].sel(
+                lat=lat,
+                lon=lon,
+                time=slice(start_str, end_str),
+                method="nearest",
+            ).load()
+
+        precip_series = data_slice.to_series()
+
+        results: Dict[str, float] = {}
+        for timestamp, value in precip_series.items():
+            date_key = timestamp.strftime("%Y-%m-%d")
+            results[date_key] = float(value) if not pd.isna(value) else 0.0
+
+        return results
+
+    except HTTPException:
+        # Re-throw FastAPI HTTPExceptions
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": f"Failed to fetch GridMET data: {type(e).__name__} - {str(e)}",
+                "info": "Check that lat/lon is in CONUS and that the THREDDS server is reachable.",
+            },
+        )
 
 
 def _fetch_precip_prism(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
     """PRISM placeholder.
 
-    IMPLEMENT ME: This should read PRISM daily precip from your local files or
-    your own PRISM server. For now, we raise a clear error so you notice it.
+    Implement this to read PRISM daily precipitation from your own
+    local NetCDF/THREDDS/Zarr store.
     """
     raise HTTPException(
         status_code=501,
@@ -210,24 +274,10 @@ def _fetch_precip_prism(lat: float, lon: float, start: dt.date, end: dt.date) ->
     )
 
 
-def _fetch_precip_gridmet(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
-    """GridMET placeholder.
-
-    IMPLEMENT ME: This should read GridMET precip from local NetCDF/THREDDS etc.
-    """
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "message": "GridMET datasource is not wired yet. "
-            "Implement _fetch_precip_gridmet() to read your GridMET data.",
-        },
-    )
-
-
 def _fetch_precip_gpm(lat: float, lon: float, start: dt.date, end: dt.date) -> Dict[str, float]:
     """GPM placeholder.
 
-    IMPLEMENT ME: This should read GPM IMERG precip (e.g., daily accumulations).
+    Implement this to read GPM IMERG precip from your own storage.
     """
     raise HTTPException(
         status_code=501,
@@ -248,10 +298,10 @@ def _fetch_precip_by_source(
     ds = _resolve_datasource(datasource)
     if ds == "era5":
         return _fetch_precip_era5(lat, lon, start, end)
-    if ds == "prism":
-        return _fetch_precip_prism(lat, lon, start, end)
     if ds == "gridmet":
         return _fetch_precip_gridmet(lat, lon, start, end)
+    if ds == "prism":
+        return _fetch_precip_prism(lat, lon, start, end)
     if ds == "gpm":
         return _fetch_precip_gpm(lat, lon, start, end)
     raise HTTPException(status_code=500, detail={"message": "Unhandled datasource routing."})
@@ -492,7 +542,6 @@ def spi_gamma_historical_auto(
             "baseline_std_mm": round(sd, 3),
             "p_zero": round(p0, 3),
             "spi": round(spi_z, 3),
-            "note": "Fallback to z-score due to insufficient positive samples for Gamma fit.",
         }
 
     shape, loc, scale = gamma_dist.fit(pos, floc=0)
@@ -555,7 +604,6 @@ def spi_gamma_series(
         except Exception:
             pass
 
-    # Pull full daily series for analysis and baseline spans
     obs_all = _fetch_precip_by_source(lat, lon, dt.date(start.year, 1, 1), dt.date(end.year, 12, 31), datasource)
     by0, by1 = _parse_baseline(baseline)
     base_all = _fetch_precip_by_source(lat, lon, dt.date(by0, 1, 1), dt.date(by1, 12, 31), datasource)
