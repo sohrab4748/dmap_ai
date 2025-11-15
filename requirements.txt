@@ -4,3 +4,7 @@ requests
 scipy
 pywavelets
 numpy 
+xarray
+netCDF4
+pandas
+
