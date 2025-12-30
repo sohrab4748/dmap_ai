@@ -9,7 +9,7 @@ import requests
 import numpy as np
 import pywt
 from pydantic import BaseModel
-from scipy.stats import gamma as gamma_dist, norm
+from scipy.stats import gamma as gamma_dist, norm, kendalltau
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -474,6 +474,15 @@ def _interp_nan_to_mean(arr: np.ndarray) -> np.ndarray:
     a[~mask] = np.interp(idx[~mask], idx[mask], a[mask])
     return a
 
+def _pseudo_observations(arr: np.ndarray) -> np.ndarray:
+    """Convert 1D array to pseudo-observations U in (0,1) via empirical CDF."""
+    a = np.asarray(arr, dtype=float)
+    n = a.size
+    if n == 0:
+        return np.empty(0, dtype=float)
+    ranks = np.argsort(np.argsort(a)) + 1  # 1..n
+    return ranks.astype(float) / (n + 1.0)
+
 
 class WaveletRequest(BaseModel):
     spi: List[float]
@@ -482,6 +491,17 @@ class WaveletRequest(BaseModel):
     min_period: int = 1
     max_period: int = 24
     n_scales: int = 10
+
+class CopulaRequest(BaseModel):
+    """Request body for bivariate copula analysis.
+
+    x, y: numerical series for two variables
+          (e.g., precip vs SPI, or SPI(t-1) vs SPI(t)).
+    pair_type: optional label ("precip_spi", "spi_lag1", etc.)
+    """
+    x: List[float]
+    y: List[float]
+    pair_type: Optional[str] = None
 
 
 # ==========================================================
@@ -885,6 +905,85 @@ def spi_wavelet(req: WaveletRequest):
         "scalogram": scalogram_data,
         "coherence": coherence,
     }
+
+@app.post("/analysis/copula_bivariate")
+def copula_bivariate(req: CopulaRequest):
+    """Fit a simple Gaussian bivariate copula to (x, y) using pseudo-observations."""
+    x = np.asarray(req.x, dtype=float)
+    y = np.asarray(req.y, dtype=float)
+
+    if x.size != y.size:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "x and y must have the same length."},
+        )
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    n = x.size
+
+    if n < 30:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Not enough points for copula analysis (need at least 30).",
+                "n": int(n),
+            },
+        )
+
+    # Pseudo-observations in (0, 1)
+    u = _pseudo_observations(x)
+    v = _pseudo_observations(y)
+
+    # Normal score transform for Gaussian copula
+    z1 = norm.ppf(u)
+    z2 = norm.ppf(v)
+
+    # Correlation in normal space
+    try:
+        rho = float(np.corrcoef(z1, z2)[0, 1])
+    except Exception:
+        rho = float("nan")
+
+    # Kendall's tau
+    try:
+        tau_val, _ = kendalltau(x, y)
+        tau_val = float(tau_val) if tau_val is not None else float("nan")
+    except Exception:
+        tau_val = float("nan")
+
+    # Empirical tail dependence at alpha=0.1
+    alpha = 0.1
+    try:
+        lower_mask = (u < alpha) & (v < alpha)
+        upper_mask = (u > 1.0 - alpha) & (v > 1.0 - alpha)
+        lambda_L = float(np.mean(lower_mask) / alpha) if np.any(lower_mask) else 0.0
+        lambda_U = float(np.mean(upper_mask) / alpha) if np.any(upper_mask) else 0.0
+    except Exception:
+        lambda_L = 0.0
+        lambda_U = 0.0
+
+    # Thin points for plotting
+    max_points = 500
+    if n > max_points:
+        idx_pts = np.linspace(0, n - 1, max_points).astype(int)
+        u_plot = u[idx_pts].tolist()
+        v_plot = v[idx_pts].tolist()
+    else:
+        u_plot = u.tolist()
+        v_plot = v.tolist()
+
+    return {
+        "pair_type": req.pair_type or "unknown",
+        "family": "gaussian",
+        "n": int(n),
+        "params": {"rho": rho},
+        "kendall_tau": tau_val,
+        "tail_dependence": {"lambda_L": lambda_L, "lambda_U": lambda_U},
+        "uv_points": {"u": u_plot, "v": v_plot},
+    }
+
 
 
 # ==========================================================
