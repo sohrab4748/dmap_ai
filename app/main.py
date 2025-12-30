@@ -474,6 +474,7 @@ def _interp_nan_to_mean(arr: np.ndarray) -> np.ndarray:
     a[~mask] = np.interp(idx[~mask], idx[mask], a[mask])
     return a
 
+
 def _pseudo_observations(arr: np.ndarray) -> np.ndarray:
     """Convert 1D array to pseudo-observations U in (0,1) via empirical CDF."""
     a = np.asarray(arr, dtype=float)
@@ -492,12 +493,13 @@ class WaveletRequest(BaseModel):
     max_period: int = 24
     n_scales: int = 10
 
+
 class CopulaRequest(BaseModel):
     """Request body for bivariate copula analysis.
 
     x, y: numerical series for two variables
           (e.g., precip vs SPI, or SPI(t-1) vs SPI(t)).
-    pair_type: optional label ("precip_spi", "spi_lag1", etc.)
+    pair_type: Optional label ("precip_spi", "spi_lag1", etc.).
     """
     x: List[float]
     y: List[float]
@@ -754,6 +756,7 @@ def spi_gamma_series(
 
     # ---------- YEARLY ----------
     years = list(range(start.year, end.year + 1))
+
     if yearly_method == "total":
         baseline_annual = [_annual_sum(y, base_all) for y in range(by0, by1 + 1)]
         p0, shape, scale, pos, zeros = _fit_gamma_from_samples(baseline_annual)
@@ -905,6 +908,8 @@ def spi_wavelet(req: WaveletRequest):
         "coherence": coherence,
     }
 
+
+
 @app.post("/analysis/copula_bivariate")
 def copula_bivariate(req: CopulaRequest):
     """Fit a simple Gaussian bivariate copula to (x, y) using pseudo-observations."""
@@ -963,6 +968,82 @@ def copula_bivariate(req: CopulaRequest):
         lambda_L = 0.0
         lambda_U = 0.0
 
+    # Severity / probability diagnostics
+    severity_stats = None
+
+    if req.pair_type == "precip_spi":
+        spi = y
+        precip = x
+        spi_drought = spi <= -1.0
+        spi_extreme = spi <= -2.0
+
+        q20 = float(np.quantile(precip, 0.20))
+        q10 = float(np.quantile(precip, 0.10))
+
+        lowP = precip <= q20
+        veryLowP = precip <= q10
+
+        P_drought = float(np.mean(spi_drought))
+        P_extreme = float(np.mean(spi_extreme))
+        P_lowP = float(np.mean(lowP))
+        P_veryLowP = float(np.mean(veryLowP))
+
+        P_d_and_lowP = float(np.mean(spi_drought & lowP))
+        P_e_and_vLowP = float(np.mean(spi_extreme & veryLowP))
+
+        P_d_given_lowP = P_d_and_lowP / P_lowP if P_lowP > 0 else None
+        P_e_given_vLowP = P_e_and_vLowP / P_veryLowP if P_veryLowP > 0 else None
+
+        severity_stats = {
+            "mode": "precip_spi",
+            "thresholds": {
+                "spi_drought": -1.0,
+                "spi_extreme": -2.0,
+                "precip_q20": q20,
+                "precip_q10": q10,
+            },
+            "marginal_probs": {
+                "P_drought": P_drought,
+                "P_extreme": P_extreme,
+                "P_lowP": P_lowP,
+                "P_veryLowP": P_veryLowP,
+            },
+            "joint_probs": {
+                "P_drought_and_lowP": P_d_and_lowP,
+                "P_extreme_and_veryLowP": P_e_and_vLowP,
+            },
+            "conditional_probs": {
+                "P_drought_given_lowP": P_d_given_lowP,
+                "P_extreme_given_veryLowP": P_e_given_vLowP,
+            },
+        }
+
+    elif req.pair_type == "spi_lag1":
+        spi_prev = x
+        spi_curr = y
+        d_prev = spi_prev <= -1.0
+        d_curr = spi_curr <= -1.0
+
+        P_prev = float(np.mean(d_prev))
+        P_nonprev = float(np.mean(~d_prev))
+
+        P_persist = float(np.mean(d_prev & d_curr) / P_prev) if P_prev > 0 else None
+        P_onset = float(np.mean((~d_prev) & d_curr) / P_nonprev) if P_nonprev > 0 else None
+
+        mean_length = None
+        if P_persist is not None and P_persist < 1.0:
+            mean_length = 1.0 / (1.0 - P_persist)
+
+        severity_stats = {
+            "mode": "spi_lag1",
+            "thresholds": {"spi_drought": -1.0},
+            "transition_probs": {
+                "P_persist": P_persist,
+                "P_onset": P_onset,
+                "approx_mean_length": mean_length,
+            },
+        }
+
     # Thin points for plotting
     max_points = 500
     if n > max_points:
@@ -981,10 +1062,8 @@ def copula_bivariate(req: CopulaRequest):
         "kendall_tau": tau_val,
         "tail_dependence": {"lambda_L": lambda_L, "lambda_U": lambda_U},
         "uv_points": {"u": u_plot, "v": v_plot},
+        "severity_stats": severity_stats,
     }
-
-
-
 # ==========================================================
 #  CONVENIENCE ENDPOINTS (MONTHLY/YEARLY WRAPPERS)
 # ==========================================================
