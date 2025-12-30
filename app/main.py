@@ -754,7 +754,6 @@ def spi_gamma_series(
 
     # ---------- YEARLY ----------
     years = list(range(start.year, end.year + 1))
-
     if yearly_method == "total":
         baseline_annual = [_annual_sum(y, base_all) for y in range(by0, by1 + 1)]
         p0, shape, scale, pos, zeros = _fit_gamma_from_samples(baseline_annual)
